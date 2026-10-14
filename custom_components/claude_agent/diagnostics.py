@@ -15,9 +15,9 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .agent import read_state
 from .const import CONF_EFFORT, CONF_FOLLOWUP, CONF_MODEL, CONF_NOTIFY, CONF_PROFILE, DEFAULT_EFFORT, DEFAULT_FOLLOWUP, DEFAULT_MODEL, DOMAIN, NO_NOTIFY
 from .memory import shared_memory
+from .state import read_state
 
 
 async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, Any]:

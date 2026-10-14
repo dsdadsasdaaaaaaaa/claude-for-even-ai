@@ -30,7 +30,6 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
-from .agent import apply_note_edits, notes_text, read_state
 from .const import (
     CHAT_PATH,
     CONF_EFFORT,
@@ -57,6 +56,7 @@ from .const import (
 )
 from .memory import shared_memory
 from .speech import DEFAULT_PROVIDER, PROVIDERS
+from .state import apply_note_edits, notes_text, read_state
 
 _LOGGER = logging.getLogger(__name__)
 

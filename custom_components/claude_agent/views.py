@@ -25,7 +25,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from . import speech
-from .agent import NO_USAGE, Agent, AnswerStopped, BadRequest, chunk, completion, convert_messages, new_id, problem_text, same_key
+from .agent import Agent, AnswerStopped, BadRequest, problem_text, same_key
 from .const import (
     API_BASE,
     CHAT_PATH,
@@ -39,6 +39,7 @@ from .const import (
     SESSION_LOG_PATH,
     SESSION_TURN_PATH,
 )
+from .formats import NO_USAGE, chunk, completion, convert_messages, new_id
 from .laptop import Laptop
 
 _LOGGER = logging.getLogger(__name__)
@@ -196,19 +197,15 @@ class ChatView(HomeAssistantView):
         started = time.monotonic()
         completion_id = new_id()
         created = int(time.time())
-        # Word by word only when the app asks for it. Even AI does not, and shows "AI server error" for an answer sent that way.
-        streamed = bool(body.get("stream"))
         timings = self._hass.data[DOMAIN].setdefault("timings", deque(maxlen=TIMINGS_KEPT))
 
-        def record(result: dict[str, Any] | None, first_text: float | None, error: str = "") -> None:
+        def record(result: dict[str, Any] | None, error: str = "") -> None:
             """How long this answer took and what went into it, without what was said."""
             stats = (result or {}).get("stats") or {}
             timings.append(
                 {
                     "at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "seconds": round(time.monotonic() - started, 2),
-                    "first_words_seconds": round(first_text - started, 2) if first_text else None,
-                    "word_by_word": streamed,
                     "claude_requests": stats.get("requests", 0),
                     "web_searches": stats.get("searches", 0),
                     "tools": stats.get("tools", []),
@@ -223,71 +220,48 @@ class ChatView(HomeAssistantView):
         def abandoned(task: asyncio.Task) -> None:
             """Records an answer the app stopped waiting for."""
             if task.cancelled():
-                record(None, None, "app gave up, then cancelled")
+                record(None, "app gave up, then cancelled")
             elif task.exception() is not None:
-                record(None, None, f"app gave up, then {type(task.exception()).__name__}")
+                record(None, f"app gave up, then {type(task.exception()).__name__}")
             else:
-                record(task.result(), None, "app gave up before it was ready")
+                record(task.result(), "app gave up before it was ready")
 
-        if not streamed:
-            try:
-                result = await _carry_through(self._hass, agent.reply(body), abandoned)
-            except BadRequest as err:
-                return _error(str(err), HTTPStatus.BAD_REQUEST)
-            except Exception as err:  # noqa: BLE001 - whatever went wrong, the app needs an answer
-                _LOGGER.warning("Claude could not be reached: %s", err)
-                record(None, None, type(err).__name__)
-                # A sentence the glasses can show, saying what to do about it, rather than an error the Even app
-                # shows its own way, if at all.
-                return web.json_response(completion(completion_id, created, agent.model, problem_text(err), NO_USAGE))
-            record(result, None)
-            return web.json_response(completion(completion_id, created, agent.model, result["text"], result["usage"]))
-
-        response = web.StreamResponse(
-            headers={"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-        )
-        await response.prepare(request)
-        listening = True
-        sent = False
-        first_text: float | None = None
-
-        async def send(payload: dict[str, Any] | str) -> None:
-            nonlocal listening
-            if not listening:
-                return
-            data = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-            try:
-                await response.write(f"data: {data}\n\n".encode())
-            except (ConnectionError, RuntimeError):
-                listening = False  # The glasses stopped listening.
-
-        async def on_text(delta: str) -> None:
-            nonlocal sent, first_text
-            sent = True
-            first_text = first_text or time.monotonic()
-            await send(chunk(completion_id, created, agent.model, {"content": delta}))
-
-        await send(chunk(completion_id, created, agent.model, {"role": "assistant", "content": ""}))
         try:
-            result = await _carry_through(self._hass, agent.reply(body, on_text), abandoned)
-        except Exception as err:  # noqa: BLE001 - whatever went wrong, leave the wearer a line to read
+            result = await _carry_through(self._hass, agent.reply(body), abandoned)
+        except BadRequest as err:
+            return _error(str(err), HTTPStatus.BAD_REQUEST)
+        except Exception as err:  # noqa: BLE001 - whatever went wrong, the app needs an answer
             _LOGGER.warning("Claude could not be reached: %s", err)
-            record(None, first_text, type(err).__name__)
-            if not sent:
-                await send(chunk(completion_id, created, agent.model, {"content": problem_text(err)}))
-            await send(chunk(completion_id, created, agent.model, {}, "stop"))
+            record(None, type(err).__name__)
+            # A sentence the glasses can show, saying what to do about it, rather than an error the Even app
+            # shows its own way, if at all.
+            text, usage = problem_text(err), NO_USAGE
         else:
-            record(result, first_text)
-            await send(chunk(completion_id, created, agent.model, {}, "stop"))
-            if isinstance(body.get("stream_options"), dict) and body["stream_options"].get("include_usage"):
-                await send({**chunk(completion_id, created, agent.model, {}), "choices": [], "usage": result["usage"]})
-        await send("[DONE]")
-        if listening:
-            try:
-                await response.write_eof()
-            except (ConnectionError, RuntimeError):
-                pass
-        return response
+            record(result)
+            text, usage = result["text"], result["usage"]
+        if body.get("stream"):
+            # The Even app never asks for a stream, and shows "AI server error" for one it did not ask for. An app that
+            # does ask gets the whole answer at once, in the streamed format it reads.
+            include_usage = isinstance(body.get("stream_options"), dict) and body["stream_options"].get("include_usage") is True
+            return web.Response(
+                text=_as_stream(completion_id, created, agent.model, text, usage if include_usage else None),
+                content_type="text/event-stream",
+                charset="utf-8",
+                headers={"Cache-Control": "no-cache"},
+            )
+        return web.json_response(completion(completion_id, created, agent.model, text, usage))
+
+
+def _as_stream(completion_id: str, created: int, model: str, text: str, usage: dict[str, int] | None) -> str:
+    """A whole answer as server-sent events in the chat-completions format: one piece, the end, and the usage if asked for."""
+    pieces: list[dict[str, Any] | str] = [
+        chunk(completion_id, created, model, {"role": "assistant", "content": text}),
+        chunk(completion_id, created, model, {}, "stop"),
+    ]
+    if usage is not None:
+        pieces.append({**chunk(completion_id, created, model, {}), "choices": [], "usage": usage})
+    pieces.append("[DONE]")
+    return "".join(f"data: {piece if isinstance(piece, str) else json.dumps(piece, ensure_ascii=False, separators=(',', ':'))}\n\n" for piece in pieces)
 
 
 def _laptop(hass: HomeAssistant, request: web.Request) -> Laptop | None:
