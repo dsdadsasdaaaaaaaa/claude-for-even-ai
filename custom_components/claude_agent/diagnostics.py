@@ -37,6 +37,8 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigE
         "recent_requests": list(shared.get("shapes", [])),
         # How long each recent answer took and what went into it (searches, tools), without what was said.
         "recent_answers": list(shared.get("timings", [])),
+        # How each recent request from the glasses app went: answered, nothing heard, wrong key, and so on.
+        "session_app_requests": list(shared.get("session_requests", [])),
         # How the laptop's jobs went, without what they asked for or found.
         "laptop": {
             "switched_on": bool(shared.get("laptop_on")),

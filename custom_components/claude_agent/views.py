@@ -45,8 +45,10 @@ _LOGGER = logging.getLogger(__name__)
 # How many request outlines, and answer timings, are kept for the diagnostics download.
 SHAPES_KEPT = 5
 TIMINGS_KEPT = 30
-# How long the laptop's request for a job is held open; short enough for any proxy on the way.
-LAPTOP_WAIT = 25
+# How long the laptop's request for a job is held open. Short, because networks on the way (school Wi-Fi, the
+# remote-access proxy) cut connections that sit idle much longer, and each cut costs a reconnect.
+LAPTOP_WAIT = 15
+SESSION_REQUESTS_KEPT = 10
 
 
 def _agent(hass: HomeAssistant) -> Agent | None:
@@ -394,28 +396,41 @@ class SessionTurnView(HomeAssistantView):
         self._hass = hass
 
     async def post(self, request: web.Request) -> web.StreamResponse:
+        shared = self._hass.data.setdefault(DOMAIN, {})
+        started = time.monotonic()
+
+        def note(outcome: str, **details: Any) -> None:
+            """Keeps how each request from the glasses app went, without what was said, for the diagnostics."""
+            shared.setdefault("session_requests", deque(maxlen=SESSION_REQUESTS_KEPT)).append(
+                {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "outcome": outcome, "seconds": round(time.monotonic() - started, 2), **details}
+            )
+
         agent = _agent(self._hass)
         if agent is None:
+            note("agent not set up")
             return _error("The agent is not set up", HTTPStatus.SERVICE_UNAVAILABLE)
         if not agent.authorized(_presented(request)):
+            note("wrong key")
             return await _refuse()
         session_id = _session_id(request)
         if not SESSION_ID.match(session_id):
+            note("no session id")
             return _error("The request needs the session's id", HTTPStatus.BAD_REQUEST)
-        shared = self._hass.data[DOMAIN]
-        started = time.monotonic()
         typed = None
         audio = b""
         if request.content_type == "application/json":
             try:
                 body = await request.json()
             except ValueError:
+                note("not JSON")
                 return _error("The request body is not JSON", HTTPStatus.BAD_REQUEST)
             typed = body.get("text") if isinstance(body, dict) and isinstance(body.get("text"), str) else ""
         else:
             audio = await request.read()
             if len(audio) > speech.MAX_AUDIO_BYTES:
+                note("recording too long", bytes=len(audio))
                 return _error("The recording is too long", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+        kind = {"kind": "typed" if typed is not None else "recording", **({"audio_seconds": round(speech.seconds_of(audio), 1)} if typed is None else {})}
 
         response = web.StreamResponse(
             headers={"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
@@ -444,7 +459,9 @@ class SessionTurnView(HomeAssistantView):
                 said = " ".join(typed.split())
             heard_at = time.monotonic()
             await send({"type": "heard", "text": said})
-            if said:
+            if not said:
+                note("connection check" if typed == "" else "nothing heard", **kind)
+            else:
 
                 async def on_text(delta: str) -> None:
                     nonlocal first_text
@@ -467,10 +484,13 @@ class SessionTurnView(HomeAssistantView):
                         "error": "",
                     }
                 )
+                note("answered", **kind)
         except speech.SpeechError as err:
+            note(f"speech-to-text: {err}", **kind)
             await send({"type": "error", "message": str(err)})
         except Exception as err:  # noqa: BLE001 - whatever went wrong, the glasses get a line to show
             _LOGGER.warning("A session turn failed: %s", err)
+            note(f"failed: {type(err).__name__}", **kind)
             await send({"type": "error", "message": LIMIT if over_limit(err) else FAILED})
         await send({"type": "done"})
         if listening:

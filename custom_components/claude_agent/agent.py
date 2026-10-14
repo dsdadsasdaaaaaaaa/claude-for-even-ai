@@ -36,7 +36,7 @@ Each press of the button is often a new question. Earlier turns are included onl
 
 You keep notes about them between conversations; they are listed further down. Save one with the remember tool when they ask you to remember something, or when they tell you a lasting fact about themselves: who they are, the people in their life, their school or work, their preferences, commitments that run for a while. Do not save passing remarks, questions they asked, or plans for today unless they ask you to. For anything that stops being true on a known date (a trip, an exam, a deadline), give the date it stops mattering, and the note goes away after it. When a note turns out to be wrong, or they ask you to forget something, remove it with the forget tool. Save quietly, unless they asked you to remember, in which case a few words to confirm is enough. Use your notes silently: bring one up only when it directly helps with what they just asked, and never mention your notes or past conversations otherwise. Their Claude app chats and the app's own memory are not available here: what you know about them is their profile, your notes, and your conversations here."""
 
-LAPTOP_INSTRUCTIONS = """You can also get things done on their Windows laptop with the laptop tool. Claude Code carries the job out there with full control of the laptop: it runs programs and commands, opens apps, websites and files, and when the laptop is unlocked it sees the screen and clicks and types in any app. Send a job only when, in this message, they ask for something to be done on their laptop or computer, or when they follow on from a laptop job you just sent; the tool turns anything else down. They have chosen to let it act without asking first, so do not ask them to confirm. But if a misheard word leaves you unsure what they want done (which file, which app, which person, what to write), ask rather than guess with their computer.
+LAPTOP_INSTRUCTIONS = """You can also get things done on their Windows laptop with the laptop tool. Claude Code carries the job out there with full control of the laptop: it runs programs and commands, opens apps, websites and files, and when the laptop is unlocked it sees the screen and clicks and types in any app. Send a job when they ask for something to be done on their laptop or computer, or for something only the laptop can do: opening an app or a website, searching, playing something, clicking or typing. A job that deletes, sends, buys or otherwise changes things only goes out when they name their laptop or computer in that message, or follow on from a job you just sent; the tool turns it down otherwise. They have chosen to let it act without asking first, so do not ask them to confirm. But if a misheard word leaves you unsure what they want done (which file, which app, which person, what to write), ask rather than guess with their computer.
 
 The laptop does not see this conversation, so write the job as a complete instruction: what they want to end up with rather than which buttons to press, with every name and detail it needs. Mark it as a follow-up only when it carries on from the job you just sent, such as "now close it".
 
@@ -156,8 +156,16 @@ SESSION_IDLE_SECONDS = 4 * 60 * 60
 
 SESSION_NOTE = """This is a session in their own glasses app, not a quick question: they opened it for a longer conversation, and every earlier turn here belongs to it, however long ago, until they end the session. They hold a button while they speak, so the words are theirs, though speech-to-text can still mishear. Give answers the room the question deserves; the display scrolls, so a fuller answer is fine when they want one, up to about 250 words, and a quick question still gets a quick answer."""
 
-# A request meant for the laptop says so. Someone else's words, or a misheard question, rarely do.
-MENTIONS_LAPTOP = re.compile(r"\b(lap ?tops?|computers?|pcs?|desktops?|screens?|monitors?)\b", re.IGNORECASE)
+# Saying where it is meant for. Speech-to-text sometimes hears "laptop" as "lab top".
+MENTIONS_LAPTOP = re.compile(r"\b(la[pb] ?tops?|computers?|pcs?|desktops?|screens?|monitors?)\b", re.IGNORECASE)
+# A job that deletes, sends, buys or otherwise changes things only goes out when they said where it is meant for,
+# so someone else's words, or a misheard sentence, can never do that. Opening and looking things up need no such words.
+CHANGES_THINGS = re.compile(
+    r"\b(delet\w*|remov\w*|eras\w*|wipe\w*|format\w*|uninstall\w*|overwrit\w*|empty\w*|send\w*|sent|e-?mail\w*|messag\w*"
+    r"|repl(y|ies|ied)|post\w*|tweet\w*|buy\w*|bought|order\w*|pay|paid|paying|purchas\w*|transfer\w*|shut ?down\w*"
+    r"|restart\w*|reboot\w*|log ?(out|off)|sign ?out|renam\w*|move|moving|moved)\b",
+    re.IGNORECASE,
+)
 
 # Said at the start, any of these starts a new chat; whatever follows is the first question in it.
 # "Start over" and "clear chat" only count on their own or before a pause, so "start over the video" is left alone.
@@ -676,13 +684,14 @@ class Agent:
             return {"content": "Nothing was sent: the job was empty.", "is_error": True}
         now = self._now().timestamp()
         follows_on = turn["laptop_at"] is not None and now - turn["laptop_at"] < LAPTOP_FOLLOW_SECONDS
-        # Their words have to ask for the laptop, so someone else's sentence can never run something on it.
-        if not MENTIONS_LAPTOP.search(turn["latest"]) and not follows_on:
-            self._log(f"not sent to the laptop, as it was not asked for: {task}")
+        # Anything that deletes, sends or buys needs their own words to name the laptop, so someone else's sentence
+        # can never do that. Opening, searching and clicking around go out on the request alone.
+        if CHANGES_THINGS.search(task) and not MENTIONS_LAPTOP.search(turn["latest"]) and not follows_on:
+            self._log(f"not sent to the laptop, as it changes things and the laptop was not named: {task}")
             return {
-                "content": "Nothing was sent. In this message they did not mention their laptop or computer, and it does not follow "
-                "on from a laptop job you just sent, so it may not be meant for the laptop or may not be their words. "
-                "Only send a job when they ask for it.",
+                "content": "Nothing was sent. This job deletes, sends, buys or otherwise changes something, and in this message they did "
+                "not say it was for their laptop or computer, so it may not be meant for the laptop or may not be their words. "
+                'In a few words, ask them to say it again with "on my laptop" if they want it.',
                 "is_error": True,
             }
         await self._laptop.submit(task, follow_up=given.get("follow_up") is True and follows_on)
@@ -763,8 +772,9 @@ class Agent:
             if not calls:
                 break
             messages.append({"role": "assistant", "content": result["content"]})
-            stats["tools"] += [str(call.get("name")) for call in calls]
             outcomes = [await self._use_tool(call, turn) for call in calls]
+            # A tool that turned the call down is marked, so the diagnostics show a laptop job that did not go out.
+            stats["tools"] += [f"{call.get('name')}{' (turned down)' if outcome.get('is_error') else ''}" for call, outcome in zip(calls, outcomes)]
             messages.append(
                 {
                     "role": "user",
