@@ -40,7 +40,7 @@ LAPTOP_INSTRUCTIONS = """You can also get things done on their Windows laptop wi
 
 The laptop does not see this conversation, so write the job as a complete instruction: what they want to end up with rather than which buttons to press, with every name and detail it needs. Mark it as a follow-up only when it carries on from the job you just sent, such as "now close it".
 
-When you send a job, tell them in a few words what is about to happen ("Opening your history essay on the laptop."), so they can catch a mishearing. It is not done yet, so never say it is. If they say stop or cancel about it, call it off with cancel_laptop_job. When it finishes, the outcome goes to their phone as a notification, so do not bring up how a job went unless they ask; when they do, check with laptop_status."""
+Send the job straight away: there is no need to check the laptop first, as the tool says if it is off. With the job, give the few words to tell them about what is about to happen ("Opening your history essay on the laptop."), so they can catch a mishearing; that is your whole reply. It is not done yet, so never say it is. If they say stop or cancel about it, call it off with cancel_laptop_job. When it finishes, the outcome goes to their phone as a notification, so do not bring up how a job went unless they ask; when they do, check with laptop_status."""
 
 REMEMBER = {
     "name": "remember",
@@ -102,11 +102,19 @@ LAPTOP = {
                 "type": "boolean",
                 "description": "True only when this carries on from the laptop job you just sent (such as \"now close it\"), so the laptop keeps that job's context.",
             },
+            "say": {
+                "type": "string",
+                "description": "What to tell them now, in a few words, about what is about to happen, such as \"Opening TikTok on your laptop.\" It is shown to them as your reply.",
+            },
         },
-        "required": ["job"],
+        "required": ["job", "say"],
         "additionalProperties": False,
     },
 }
+
+# Tools that can share a round with a laptop job without needing Claude to say more once they work.
+# Skipping that extra request keeps a laptop request quick enough for the Even app, which gives up after a few seconds.
+NO_FOLLOW_UP = {"laptop", "remember", "forget"}
 
 LAPTOP_STATUS = {
     "name": "laptop_status",
@@ -740,6 +748,7 @@ class Agent:
         for _ in range(MAX_REQUESTS):
             new_request = True
             new_stretch = True
+            written_before = len(text)
 
             async def forward(delta: str | None) -> None:
                 nonlocal text, new_request, new_stretch
@@ -783,6 +792,21 @@ class Agent:
             )
             # Kept straight away, so a note survives whatever happens to the rest of the turn.
             await self._store.write(state)
+            # A laptop job that went out needs no second request, as what to tell them is already known:
+            # the words Claude wrote alongside the call, or else the "say" it gave with the job.
+            sent_job = any(call.get("name") == "laptop" for call in calls)
+            if sent_job and all(call.get("name") in NO_FOLLOW_UP for call in calls) and not any(outcome.get("is_error") for outcome in outcomes):
+                if text[written_before:].strip():
+                    break
+                said = " ".join(
+                    call["input"]["say"].strip()
+                    for call in calls
+                    if call.get("name") == "laptop" and isinstance(call.get("input"), dict) and isinstance(call["input"].get("say"), str)
+                ).strip()
+                if said:
+                    await forward(None)
+                    await forward(said)
+                    break
         usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
         return {"text": text.strip(), "usage": usage, "stop_reason": stop_reason, "stats": stats}
 

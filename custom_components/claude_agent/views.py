@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import Callable, Coroutine
 import hmac
 from http import HTTPStatus
 import json
@@ -67,6 +68,21 @@ def _presented(request: web.Request) -> str:
 
 def _error(message: str, status: HTTPStatus) -> web.Response:
     return web.json_response({"error": {"message": message}}, status=status)
+
+
+async def _carry_through(hass: HomeAssistant, answer: Coroutine[Any, Any, dict[str, Any]], abandoned: Callable[[asyncio.Task], None]) -> dict[str, Any]:
+    """Waits for `answer`, which runs to its end even when the app hangs up first.
+
+    The Even app gives up after a few seconds and Home Assistant then cancels the
+    request, which would stop a laptop job from going out and the turn from being
+    kept. Instead it carries on, and `abandoned` hears how it ended.
+    """
+    task = hass.async_create_task(answer, "claude_agent answer")
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.add_done_callback(abandoned)
+        raise
 
 
 async def _refuse() -> web.Response:
@@ -195,9 +211,18 @@ class ChatView(HomeAssistantView):
                 }
             )
 
+        def abandoned(task: asyncio.Task) -> None:
+            """Records an answer the app stopped waiting for."""
+            if task.cancelled():
+                record(None, None, "app gave up, then cancelled")
+            elif task.exception() is not None:
+                record(None, None, f"app gave up, then {type(task.exception()).__name__}")
+            else:
+                record(task.result(), None, "app gave up before it was ready")
+
         if not streamed:
             try:
-                result = await agent.reply(body)
+                result = await _carry_through(self._hass, agent.reply(body), abandoned)
             except BadRequest as err:
                 return _error(str(err), HTTPStatus.BAD_REQUEST)
             except Exception as err:  # noqa: BLE001 - whatever went wrong, the app needs an answer
@@ -236,7 +261,7 @@ class ChatView(HomeAssistantView):
 
         await send(chunk(completion_id, created, agent.model, {"role": "assistant", "content": ""}))
         try:
-            result = await agent.reply(body, on_text)
+            result = await _carry_through(self._hass, agent.reply(body, on_text), abandoned)
         except Exception as err:  # noqa: BLE001 - whatever went wrong, leave the wearer a line to read
             _LOGGER.warning("Claude could not be reached: %s", err)
             record(None, first_text, type(err).__name__)
