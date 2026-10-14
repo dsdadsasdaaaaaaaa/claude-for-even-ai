@@ -46,7 +46,7 @@ QUICK_NOTE = """This is a quick question through Even AI on the glasses. Nothing
 
 Each press of the button is often a new question. Earlier turns are included only while they keep talking within a few minutes of each other, and you are told how long ago their last message was. Connect a message to earlier turns only when it clearly follows on (it refers back with words like "it" or "that", or carries on the same topic). Otherwise treat it as a fresh question and leave the earlier topic alone. They can say "new chat" to start over."""
 
-FIRST_NOTE = """You answer first, on a quick, lightweight model, and a stronger one is standing by. Answer what you can answer well straight away: facts you are sure of, short explanations, conversation, saving and removing notes, looking back at earlier conversations, and anything to do with their laptop (sending a job, how one went, calling one off). When a good answer needs more, call hand_off before you write anything, and the stronger model answers in your place: careful thought (advice, plans, comparisons, maths, explaining something subtle), and anything current or that you are not sure of (it can search the web). When in doubt about a question, hand off."""
+FIRST_NOTE = """You answer first, on a quick, lightweight model, and a stronger one is standing by. Answer what you can answer well straight away: facts you are sure of, short explanations, conversation, saving and removing notes, looking back at earlier conversations, and how laptop jobs went or calling one off. When a good answer needs more, call hand_off before you write anything, and the stronger model answers in your place: careful thought (advice, plans, comparisons, maths, explaining something subtle), anything current or that you are not sure of (it can search the web), and anything to be done on their laptop. When in doubt, hand off."""
 
 SESSION_NOTE = """This is a session in their own glasses app, not a quick question: they opened it for a longer conversation, and every earlier turn here belongs to it until they end it or say "new chat". They hold or tap the ring while they speak, so the words are nearly always theirs, but a word or two from someone nearby can slip in at the start or end, and speech-to-text can mishear; what is said above about words that may not be theirs still applies. Your answer appears on the glasses as you write it and the display scrolls, so a fuller answer is fine when they want one, up to about 250 words, and a quick question still gets a quick answer."""
 
@@ -135,12 +135,12 @@ HAND_OFF = {
     "name": "hand_off",
     "description": (
         "Pass this question to a stronger model, which answers it in your place. Call it before writing anything, when "
-        "a good answer needs careful thought or the web."
+        "a good answer needs careful thought, the web, or their laptop."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
-            "why": {"type": "string", "enum": ["thinking", "web"], "description": "What the question needs: careful thought, or the web."},
+            "why": {"type": "string", "enum": ["thinking", "web", "laptop"], "description": "What the question needs: careful thought, the web, or their laptop."},
         },
         "required": ["why"],
         "additionalProperties": False,
@@ -148,7 +148,7 @@ HAND_OFF = {
 }
 
 # Tools that can share a round with a laptop job without needing Claude to say more once they work.
-# Skipping that extra request keeps a laptop request quick enough for the Even app, which gives up after a few seconds.
+# Skipping that extra request makes a laptop request quicker and cheaper.
 NO_FOLLOW_UP = {"laptop", "remember", "forget"}
 
 LAPTOP_STATUS = {
@@ -706,8 +706,7 @@ class Agent:
         key = (model, first)
         if key not in self._tool_sets:
             if first:
-                # Haiku sends laptop jobs itself: handing them on would make Even AI wait too long for the reply.
-                tools = [REMEMBER, FORGET, EARLIER, HAND_OFF, *([LAPTOP, LAPTOP_STATUS, CANCEL_LAPTOP] if self._laptop_on else [])]
+                tools = [REMEMBER, FORGET, EARLIER, HAND_OFF, *([LAPTOP_STATUS, CANCEL_LAPTOP] if self._laptop_on else [])]
             else:
                 # The newer search tool filters its own results; Haiku is only offered the basic one.
                 search = {"type": "web_search_20250305" if model.startswith("claude-haiku") else "web_search_20260209", "name": "web_search", "max_uses": 3}
@@ -1145,7 +1144,7 @@ class Agent:
             if handing is not None:
                 why = handing["input"].get("why") if isinstance(handing.get("input"), dict) else None
                 usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
-                return {"text": "", "usage": usage, "stop_reason": stop_reason, "stats": stats, "hand_off": why if why in ("thinking", "web") else "thinking"}
+                return {"text": "", "usage": usage, "stop_reason": stop_reason, "stats": stats, "hand_off": why if why in ("thinking", "web", "laptop") else "thinking"}
             messages.append({"role": "assistant", "content": result["content"]})
             outcomes = [await self._use_tool(call, turn) for call in calls]
             # A tool that turned the call down is marked, so the diagnostics show a laptop job that did not go out.
@@ -1198,8 +1197,6 @@ class Agent:
             used = model.split("-")[1]
         elif self._auto:
             first = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, model=HAIKU, effort=self._effort, first=True)
-            # No thinking pass first: Even AI gives up after a few seconds, and what needs thought is handed on anyway.
-            first["thinking"] = {"type": "disabled"}
             tried = await self._run(first, state, turn, None)
             if not tried.get("hand_off") and tried["stop_reason"] != "refusal" and tried["text"]:
                 tried["stats"]["model"] = "haiku"
@@ -1209,8 +1206,8 @@ class Agent:
             # Haiku passed it on, or could not answer (it has no fallback of its own when a classifier declines).
             why = tried.get("hand_off") or ("refused" if tried["stop_reason"] == "refusal" else "no answer")
             spent = tried
-            # Even AI is still waiting, so the effort stays where it is set; Sonnet thinks as much as it needs within it.
-            model, effort = SONNET, self._effort
+            model = SONNET
+            effort = "medium" if why == "thinking" and self._effort == "low" else self._effort
             used = f"haiku, then sonnet ({why})"
             turn["partial"] = ""
         else:

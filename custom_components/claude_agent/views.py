@@ -77,9 +77,9 @@ def _error(message: str, status: HTTPStatus) -> web.Response:
 async def _carry_through(hass: HomeAssistant, answer: Coroutine[Any, Any, dict[str, Any]], abandoned: Callable[[asyncio.Task], None]) -> dict[str, Any]:
     """Waits for `answer`, which runs to its end even when the app hangs up first.
 
-    The Even app gives up after a few seconds and Home Assistant then cancels the
-    request, which would stop a laptop job from going out and the turn from being
-    kept. Instead it carries on, and `abandoned` hears how it ended.
+    When the app hangs up, Home Assistant cancels the request, which would stop a
+    laptop job from going out and the turn from being kept. Instead it carries on,
+    and `abandoned` hears how it ended.
     """
     task = hass.async_create_task(answer, "claude_agent answer")
     try:
@@ -196,8 +196,8 @@ class ChatView(HomeAssistantView):
         started = time.monotonic()
         completion_id = new_id()
         created = int(time.time())
-        # Word by word when the app asks for it, or when switched on under Configure to try it with an app that does not ask.
-        streamed = bool(body.get("stream")) or bool(self._hass.data[DOMAIN].get("stream_always"))
+        # Word by word only when the app asks for it. Even AI does not, and shows "AI server error" for an answer sent that way.
+        streamed = bool(body.get("stream"))
         timings = self._hass.data[DOMAIN].setdefault("timings", deque(maxlen=TIMINGS_KEPT))
 
         def record(result: dict[str, Any] | None, first_text: float | None, error: str = "") -> None:

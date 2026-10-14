@@ -31,7 +31,6 @@ from .const import (
     CONF_MODEL,
     CONF_NOTIFY,
     CONF_PROFILE,
-    CONF_STREAM,
     CONF_STT_KEY,
     CONF_STT_PROVIDER,
     CONF_TOKEN,
@@ -71,8 +70,6 @@ def make_ask(client: anthropic.AsyncAnthropic) -> Callable[[dict[str, Any], Call
             options["betas"] = [FALLBACK_BETA]
         if request.get("tool_choice"):
             options["tool_choice"] = request["tool_choice"]
-        if request.get("thinking"):
-            extra_body["thinking"] = request["thinking"]
         async with client.beta.messages.stream(
             model=request["model"],
             max_tokens=request["max_tokens"],
@@ -168,7 +165,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         laptop=laptop,
         laptop_on=laptop_on,
         laptop_token=entry.data[CONF_LAPTOP_TOKEN],
-        stream_always=entry.options.get(CONF_STREAM, False),
         stt_provider=entry.options.get(CONF_STT_PROVIDER, DEFAULT_PROVIDER),
         stt_key=entry.options.get(CONF_STT_KEY, ""),
         client=client,

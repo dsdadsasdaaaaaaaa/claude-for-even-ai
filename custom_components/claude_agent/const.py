@@ -16,8 +16,6 @@ CONF_FOLLOWUP = "followup_minutes"
 DEFAULT_FOLLOWUP = 3
 # Shown and edited under Configure, but kept with the agent's memory rather than in the settings.
 CONF_NOTES = "notes"
-# Send answers word by word even though the Even app does not ask for it, to see whether it copes.
-CONF_STREAM = "stream_always"
 # Speech to text for sessions from the glasses app.
 CONF_STT_PROVIDER = "stt_provider"
 CONF_STT_KEY = "stt_key"

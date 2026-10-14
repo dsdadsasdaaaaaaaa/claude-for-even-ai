@@ -43,7 +43,6 @@ from .const import (
     CONF_NOTES,
     CONF_NOTIFY,
     CONF_PROFILE,
-    CONF_STREAM,
     CONF_STT_KEY,
     CONF_STT_PROVIDER,
     CONF_TOKEN,
@@ -242,7 +241,6 @@ class ClaudeAgentOptionsFlow(OptionsFlow):
                     NumberSelectorConfig(min=1, max=60, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min")
                 ),
                 vol.Optional(CONF_NOTES, description={"suggested_value": self._notes_shown}): TextSelector(TextSelectorConfig(multiline=True)),
-                vol.Required(CONF_STREAM, default=current.get(CONF_STREAM, False)): BooleanSelector(),
                 vol.Required(CONF_STT_PROVIDER, default=current.get(CONF_STT_PROVIDER, DEFAULT_PROVIDER)): _choices(
                     {name: preset["label"] for name, preset in PROVIDERS.items()}
                 ),

@@ -33,7 +33,6 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigE
         "notes": len(memory["notes"]),
         "conversation_turns": len(memory["thread"]["turns"]) if memory["thread"] else 0,
         "earlier_conversations": len(memory["earlier"]),
-        "word_by_word": bool(shared.get("stream_always")),
         "speech_to_text": {"provider": shared.get("stt_provider"), "key_set": bool(shared.get("stt_key"))},
         "open_sessions": len(memory["sessions"]),
         "recent_requests": list(shared.get("shapes", [])),
