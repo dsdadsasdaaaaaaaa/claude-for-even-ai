@@ -14,6 +14,7 @@ import hmac
 from http import HTTPStatus
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -21,9 +22,22 @@ from aiohttp import web
 
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+from . import speech
 from .agent import FAILED, LIMIT, NO_USAGE, Agent, BadRequest, chunk, completion, convert_messages, new_id, over_limit
-from .const import API_BASE, CHAT_PATH, DOMAIN, LAPTOP_DONE_PATH, LAPTOP_NEXT_PATH, LAPTOP_START_PATH, LAPTOP_WATCH_PATH, MODELS_PATH
+from .const import (
+    API_BASE,
+    CHAT_PATH,
+    DOMAIN,
+    LAPTOP_DONE_PATH,
+    LAPTOP_NEXT_PATH,
+    LAPTOP_START_PATH,
+    LAPTOP_WATCH_PATH,
+    MODELS_PATH,
+    SESSION_END_PATH,
+    SESSION_TURN_PATH,
+)
 from .laptop import Laptop
 
 _LOGGER = logging.getLogger(__name__)
@@ -351,6 +365,162 @@ class LaptopDoneView(HomeAssistantView):
         return web.json_response({"ok": True})
 
 
+SESSION_ID = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+
+# The glasses app runs in a web view inside the Even app, so its requests are cross-site. The key, not a
+# cookie, is what lets a request in, so any origin may make one.
+CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Session-Id",
+    "Access-Control-Max-Age": "86400",
+}
+
+
+def _cors(response: web.StreamResponse) -> web.StreamResponse:
+    response.headers.update(CORS)
+    return response
+
+
+async def _preflight(request: web.Request) -> web.Response:
+    """The browser asking whether the app may make its request."""
+    return web.Response(status=HTTPStatus.NO_CONTENT, headers=CORS)
+
+
+class SessionTurnView(HomeAssistantView):
+    """One turn of a session from the glasses app.
+
+    The body is the recording made while the ring was held (a WAV file), or
+    {"text": ...} as JSON. The answer streams back as server-sent events:
+    {"type": "heard", "text"} with what was understood, then {"type": "text",
+    "text"} pieces of the answer as it is written, {"type": "error", "message"}
+    if something went wrong, and finally {"type": "done"}.
+    """
+
+    url = SESSION_TURN_PATH
+    name = "api:claude_agent:session:turn"
+    requires_auth = False
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
+
+    async def options(self, request: web.Request) -> web.Response:
+        return await _preflight(request)
+
+    async def post(self, request: web.Request) -> web.StreamResponse:
+        agent = _agent(self._hass)
+        if agent is None:
+            return _cors(_error("The agent is not set up", HTTPStatus.SERVICE_UNAVAILABLE))
+        if not agent.authorized(_presented(request)):
+            return _cors(await _refuse())
+        session_id = request.headers.get("X-Session-Id", "")
+        if not SESSION_ID.match(session_id):
+            return _cors(_error("The request needs an X-Session-Id header", HTTPStatus.BAD_REQUEST))
+        shared = self._hass.data[DOMAIN]
+        started = time.monotonic()
+        typed = None
+        audio = b""
+        if request.content_type == "application/json":
+            try:
+                body = await request.json()
+            except ValueError:
+                return _cors(_error("The request body is not JSON", HTTPStatus.BAD_REQUEST))
+            typed = body.get("text") if isinstance(body, dict) and isinstance(body.get("text"), str) else ""
+        else:
+            audio = await request.read()
+            if len(audio) > speech.MAX_AUDIO_BYTES:
+                return _cors(_error("The recording is too long", HTTPStatus.REQUEST_ENTITY_TOO_LARGE))
+
+        response = web.StreamResponse(
+            headers={"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", **CORS}
+        )
+        await response.prepare(request)
+        listening = True
+
+        async def send(event: dict[str, Any]) -> None:
+            nonlocal listening
+            if not listening:
+                return
+            try:
+                await response.write(f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n".encode())
+            except (ConnectionError, RuntimeError):
+                listening = False  # The app stopped listening.
+
+        heard_at = None
+        first_text: float | None = None
+        try:
+            if typed is None:
+                words = speech.vocabulary(agent.profile, await agent.vocabulary_sources())
+                said = await speech.transcribe(async_get_clientsession(self._hass), shared.get("stt_provider", ""), shared.get("stt_key", ""), audio, words)
+                if speech.probably_silence(said, audio):
+                    said = ""
+            else:
+                said = " ".join(typed.split())
+            heard_at = time.monotonic()
+            await send({"type": "heard", "text": said})
+            if said:
+
+                async def on_text(delta: str) -> None:
+                    nonlocal first_text
+                    first_text = first_text or time.monotonic()
+                    await send({"type": "text", "text": delta})
+
+                result = await agent.session_reply(session_id, said, on_text)
+                stats = result.get("stats") or {}
+                shared.setdefault("timings", deque(maxlen=TIMINGS_KEPT)).append(
+                    {
+                        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "session": True,
+                        "seconds": round(time.monotonic() - started, 2),
+                        "speech_to_text_seconds": round(heard_at - started, 2) if typed is None else None,
+                        "first_words_seconds": round(first_text - started, 2) if first_text else None,
+                        "claude_requests": stats.get("requests", 0),
+                        "web_searches": stats.get("searches", 0),
+                        "tools": stats.get("tools", []),
+                        "stop": result.get("stop_reason", ""),
+                        "error": "",
+                    }
+                )
+        except speech.SpeechError as err:
+            await send({"type": "error", "message": str(err)})
+        except Exception as err:  # noqa: BLE001 - whatever went wrong, the glasses get a line to show
+            _LOGGER.warning("A session turn failed: %s", err)
+            await send({"type": "error", "message": LIMIT if over_limit(err) else FAILED})
+        await send({"type": "done"})
+        if listening:
+            try:
+                await response.write_eof()
+            except (ConnectionError, RuntimeError):
+                pass
+        return response
+
+
+class SessionEndView(HomeAssistantView):
+    """Where the glasses app says a session is over, so it is kept with the earlier conversations."""
+
+    url = SESSION_END_PATH
+    name = "api:claude_agent:session:end"
+    requires_auth = False
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
+
+    async def options(self, request: web.Request) -> web.Response:
+        return await _preflight(request)
+
+    async def post(self, request: web.Request) -> web.Response:
+        agent = _agent(self._hass)
+        if agent is None:
+            return _cors(_error("The agent is not set up", HTTPStatus.SERVICE_UNAVAILABLE))
+        if not agent.authorized(_presented(request)):
+            return _cors(await _refuse())
+        session_id = await _job_id(request)
+        if not session_id or not SESSION_ID.match(session_id):
+            return _cors(_error("The request needs the session's id", HTTPStatus.BAD_REQUEST))
+        await agent.end_session(session_id)
+        return _cors(web.json_response({"ok": True}))
+
+
 def register_views(hass: HomeAssistant) -> None:
     """Add the addresses to Home Assistant's web server. They stay for as long as it runs."""
     hass.http.register_view(HealthView(hass))
@@ -360,3 +530,5 @@ def register_views(hass: HomeAssistant) -> None:
     hass.http.register_view(LaptopStartView(hass))
     hass.http.register_view(LaptopWatchView(hass))
     hass.http.register_view(LaptopDoneView(hass))
+    hass.http.register_view(SessionTurnView(hass))
+    hass.http.register_view(SessionEndView(hass))

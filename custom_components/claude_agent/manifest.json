@@ -11,5 +11,5 @@
   "issue_tracker": "https://github.com/dsdadsasdaaaaaaaa/claude-for-even-ai/issues",
   "requirements": ["anthropic>=0.52.0"],
   "single_config_entry": true,
-  "version": "0.4.0"
+  "version": "0.5.0"
 }

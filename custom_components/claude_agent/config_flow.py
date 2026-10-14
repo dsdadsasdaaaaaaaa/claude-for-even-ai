@@ -41,6 +41,8 @@ from .const import (
     CONF_NOTIFY,
     CONF_PROFILE,
     CONF_STREAM,
+    CONF_STT_KEY,
+    CONF_STT_PROVIDER,
     CONF_TOKEN,
     DEFAULT_EFFORT,
     DEFAULT_FOLLOWUP,
@@ -52,6 +54,7 @@ from .const import (
     NO_NOTIFY,
 )
 from .memory import shared_memory
+from .speech import DEFAULT_PROVIDER, PROVIDERS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -208,6 +211,12 @@ class ClaudeAgentOptionsFlow(OptionsFlow):
                 ),
                 vol.Optional(CONF_NOTES, description={"suggested_value": notes_text(notes)}): TextSelector(TextSelectorConfig(multiline=True)),
                 vol.Required(CONF_STREAM, default=current.get(CONF_STREAM, False)): BooleanSelector(),
+                vol.Required(CONF_STT_PROVIDER, default=current.get(CONF_STT_PROVIDER, DEFAULT_PROVIDER)): _choices(
+                    {name: preset["label"] for name, preset in PROVIDERS.items()}
+                ),
+                vol.Optional(CONF_STT_KEY, description={"suggested_value": current.get(CONF_STT_KEY, "")}): TextSelector(
+                    TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                ),
                 vol.Required(CONF_LAPTOP, default=current.get(CONF_LAPTOP, True)): BooleanSelector(),
                 vol.Required(CONF_NOTIFY, default=notify): _choices(targets),
             }

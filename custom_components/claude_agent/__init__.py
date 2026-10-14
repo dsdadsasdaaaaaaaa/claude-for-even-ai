@@ -31,6 +31,8 @@ from .const import (
     CONF_NOTIFY,
     CONF_PROFILE,
     CONF_STREAM,
+    CONF_STT_KEY,
+    CONF_STT_PROVIDER,
     CONF_TOKEN,
     DEFAULT_EFFORT,
     DEFAULT_FOLLOWUP,
@@ -40,6 +42,7 @@ from .const import (
 )
 from .laptop import DONE, EXPIRED, FAILED, Laptop
 from .memory import shared_memory
+from .speech import DEFAULT_PROVIDER
 from .views import register_views
 
 _LOGGER = logging.getLogger(__name__)
@@ -125,6 +128,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         laptop_on=laptop_on,
         laptop_token=entry.data[CONF_LAPTOP_TOKEN],
         stream_always=entry.options.get(CONF_STREAM, False),
+        stt_provider=entry.options.get(CONF_STT_PROVIDER, DEFAULT_PROVIDER),
+        stt_key=entry.options.get(CONF_STT_KEY, ""),
     )
     shared["agent"] = Agent(
         ask_claude=make_ask(client),

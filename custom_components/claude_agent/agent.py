@@ -152,6 +152,11 @@ LAPTOP_RESULT_CHARS = 600
 LAPTOP_FOLLOW_SECONDS = 5 * 60
 # A job that finished this recently, and that they have not heard about, is mentioned once in the next answer.
 LAPTOP_NEWS_SECONDS = 15 * 60
+# A session in the glasses app keeps this much of itself, and is put away after this long untouched.
+SESSION_TURNS = 40
+SESSION_IDLE_SECONDS = 4 * 60 * 60
+
+SESSION_NOTE = """This is a session in their own glasses app, not a quick question: they opened it for a longer conversation, and every earlier turn here belongs to it, however long ago, until they end the session. They hold a button while they speak, so the words are theirs, though speech-to-text can still mishear. Give answers the room the question deserves; the display scrolls, so a fuller answer is fine when they want one, up to about 250 words, and a quick question still gets a quick answer."""
 
 # A request meant for the laptop says so. Someone else's words, or a misheard question, rarely do.
 MENTIONS_LAPTOP = re.compile(r"\b(lap ?tops?|computers?|pcs?|desktops?|screens?|monitors?)\b", re.IGNORECASE)
@@ -238,9 +243,9 @@ def text_of(content: Any) -> str:
     return "".join(parts)
 
 
-def recent(messages: list[Message]) -> list[Message]:
+def recent(messages: list[Message], limit: int = MAX_TURNS) -> list[Message]:
     """The last few turns, starting on one of the wearer's."""
-    kept = messages[-MAX_TURNS:]
+    kept = messages[-limit:]
     while kept and kept[0]["role"] != "user":
         kept.pop(0)
     return kept
@@ -294,6 +299,28 @@ def _turns(stored: Any) -> list[Message]:
     ]
 
 
+def _thread(thread: Any) -> dict[str, Any] | None:
+    """A conversation in progress, quick chat or session, or None when there is nothing usable."""
+    if not isinstance(thread, dict) or not _number(thread.get("at")):
+        return None
+    turns = _turns(thread.get("turns"))
+    if not turns:
+        return None
+    stored_changes = thread.get("changes")
+    changes = [
+        {"action": change["action"], "text": change["text"]}
+        for change in (stored_changes if isinstance(stored_changes, list) else [])
+        if isinstance(change, dict) and change.get("action") in ("saved", "removed") and isinstance(change.get("text"), str)
+    ]
+    return {
+        "started": float(thread["started"]) if _number(thread.get("started")) else float(thread["at"]),
+        "at": float(thread["at"]),
+        "turns": turns,
+        "changes": changes,
+        "laptop_at": float(thread["laptop_at"]) if _number(thread.get("laptop_at")) else None,
+    }
+
+
 def read_state(raw: Any) -> dict[str, Any]:
     """Whatever was stored, coerced into the shape the agent relies on."""
     data = raw if isinstance(raw, dict) else {}
@@ -306,31 +333,25 @@ def read_state(raw: Any) -> dict[str, Any]:
                 kept["until"] = note["until"]
             notes.append(kept)
 
-    thread = data.get("thread")
-    turns = _turns(thread.get("turns")) if isinstance(thread, dict) else []
-    stored_changes = thread.get("changes") if isinstance(thread, dict) else None
-    changes = [
-        {"action": change["action"], "text": change["text"]}
-        for change in (stored_changes if isinstance(stored_changes, list) else [])
-        if isinstance(change, dict) and change.get("action") in ("saved", "removed") and isinstance(change.get("text"), str)
-    ]
-    kept_thread = None
-    if isinstance(thread, dict) and _number(thread.get("at")) and turns:
-        kept_thread = {
-            "started": float(thread["started"]) if _number(thread.get("started")) else float(thread["at"]),
-            "at": float(thread["at"]),
-            "turns": turns,
-            "changes": changes,
-            "laptop_at": float(thread["laptop_at"]) if _number(thread.get("laptop_at")) else None,
-        }
+    stored_sessions = data.get("sessions")
+    sessions = {}
+    for session_id, session in (stored_sessions.items() if isinstance(stored_sessions, dict) else []):
+        kept_session = _thread(session)
+        if isinstance(session_id, str) and kept_session:
+            sessions[session_id] = kept_session
 
     stored_earlier = data.get("earlier")
     earlier = [
-        {"started": float(old["started"]), "at": float(old["at"]), "turns": _turns(old.get("turns"))}
+        {
+            "started": float(old["started"]),
+            "at": float(old["at"]),
+            "turns": _turns(old.get("turns")),
+            "kind": "session" if old.get("kind") == "session" else "chat",
+        }
         for old in (stored_earlier if isinstance(stored_earlier, list) else [])
         if isinstance(old, dict) and _number(old.get("started")) and _number(old.get("at")) and _turns(old.get("turns"))
     ]
-    return {"notes": notes, "thread": kept_thread, "earlier": earlier[-EARLIER_KEPT:]}
+    return {"notes": notes, "thread": _thread(data.get("thread")), "sessions": sessions, "earlier": earlier[-EARLIER_KEPT:]}
 
 
 NOTE_LINE = re.compile(r"^(?P<text>.*?)\s*\(until (?P<until>\d{4}-\d{2}-\d{2})\)$")
@@ -435,6 +456,7 @@ class Agent:
         self._turn = asyncio.Lock()
 
         about = profile.strip()
+        self.profile = about
         instructions = f"{INSTRUCTIONS}\n\n{LAPTOP_INSTRUCTIONS}" if laptop else INSTRUCTIONS
         self._fixed = (
             f"{instructions}\n\nTheir profile, in their own words. Treat it as trusted background.\n<profile>\n{about}\n</profile>"
@@ -512,11 +534,14 @@ class Agent:
         changes: list[dict[str, str]],
         since: float | None,
         news: list[dict[str, Any]] | None = None,
+        session: bool = False,
     ) -> dict[str, Any]:
         now = self._now()
         zone = f" {now.tzname()}" if now.tzname() else ""
         live = f"Right now it is {now:%A}, {now:%B} {now.day}, {now.year} at {self._clock(now)}{zone}."
-        if since is not None:
+        if session:
+            live += f"\n\n{SESSION_NOTE}"
+        elif since is not None:
             live += f" Their last message in this conversation was {ago(since)} ago."
         if news:
             live += f"\n\n{self._news_block(news)}"
@@ -594,15 +619,27 @@ class Agent:
             return {"content": f'Removed "{gone["text"]}". The notes after it are now numbered one lower.'}
         return {"content": "There is no such tool.", "is_error": True}
 
-    def _retire(self, state: dict[str, Any]) -> None:
-        """Put the conversation in progress away with the earlier ones, so it can still be looked up."""
-        thread = state["thread"]
-        state["thread"] = None
+    def _file_away(self, state: dict[str, Any], thread: dict[str, Any] | None, kind: str) -> None:
+        """Keep a finished conversation with the earlier ones, so it can still be looked up."""
         since = self._now().timestamp() - EARLIER_SECONDS
         kept = [old for old in state["earlier"] if old["at"] >= since]
         if thread and thread["at"] >= since:
-            kept.append({"started": thread["started"], "at": thread["at"], "turns": thread["turns"]})
+            kept.append({"started": thread["started"], "at": thread["at"], "turns": thread["turns"], "kind": kind})
+        kept.sort(key=lambda old: old["at"])
         state["earlier"] = kept[-EARLIER_KEPT:]
+
+    def _retire(self, state: dict[str, Any]) -> None:
+        """Put the quick chat in progress away with the earlier ones."""
+        thread = state["thread"]
+        state["thread"] = None
+        self._file_away(state, thread, "chat")
+
+    def _retire_sessions(self, state: dict[str, Any], *, only: str | None = None) -> None:
+        """Put away one session, or every session left untouched for hours (the app was closed without ending it)."""
+        now = self._now().timestamp()
+        for session_id in list(state["sessions"]):
+            if session_id == only or (only is None and now - state["sessions"][session_id]["at"] > SESSION_IDLE_SECONDS):
+                self._file_away(state, state["sessions"].pop(session_id), "session")
 
     def _earlier_text(self, earlier: list[dict[str, Any]]) -> str:
         since = self._now().timestamp() - EARLIER_SECONDS
@@ -612,7 +649,8 @@ class Agent:
         parts: list[str] = []
         used = 0
         for old in recent_ones:
-            lines = [f"Conversation from {self._when(old['started'])} to {self._when(old['at'])}:"]
+            what = "Session in their glasses app" if old.get("kind") == "session" else "Conversation"
+            lines = [f"{what} from {self._when(old['started'])} to {self._when(old['at'])}:"]
             lines += [f"{'They' if turn['role'] == 'user' else 'You'} said: {turn['content']}" for turn in old["turns"]]
             text = "\n".join(lines)
             if parts and used + len(text) > EARLIER_CHARS:
@@ -797,28 +835,13 @@ class Agent:
             if not same_conversation:
                 self._retire(state)
 
+            self._retire_sessions(state)
+
             # When the app sends only the newest line, carry the conversation on from where it was left.
             carried_on = len(incoming) == 1 and same_conversation
             messages = recent([*thread["turns"], *incoming] if carried_on else incoming)
-            turn = {
-                "notes": state["notes"],
-                "changes": list(thread["changes"]) if same_conversation else [],
-                "earlier": state["earlier"],
-                "latest": latest,
-                "laptop_at": thread["laptop_at"] if same_conversation else None,
-            }
             since = started - thread["at"] if carried_on else None
-            news = await self._laptop.untold(LAPTOP_NEWS_SECONDS) if self._laptop else []
-
-            request = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, news)
-            result = await self._run(request, state, turn, on_text)
-            if not result["text"]:
-                result["text"] = REFUSED if result["stop_reason"] == "refusal" else EMPTY
-                if on_text:
-                    await on_text(result["text"])
-            if news:
-                await self._laptop.mark_told([job["id"] for job in news])
-
+            result, turn = await self._answer(state, messages, app_notes, thread if same_conversation else None, latest, since, on_text)
             state["thread"] = {
                 "started": thread["started"] if same_conversation else started,
                 "at": self._now().timestamp(),
@@ -828,3 +851,68 @@ class Agent:
             }
             await self._store.write(state)
             return result
+
+    async def _answer(
+        self,
+        state: dict[str, Any],
+        messages: list[Message],
+        app_notes: str,
+        thread: dict[str, Any] | None,
+        latest: str,
+        since: float | None,
+        on_text: OnText | None,
+        *,
+        session: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Asks Claude, carrying out any tools it uses, and returns its answer and what changed along the way."""
+        turn = {
+            "notes": state["notes"],
+            "changes": list(thread["changes"]) if thread else [],
+            "earlier": state["earlier"],
+            "latest": latest,
+            "laptop_at": thread["laptop_at"] if thread else None,
+        }
+        news = await self._laptop.untold(LAPTOP_NEWS_SECONDS) if self._laptop else []
+        request = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, news, session)
+        result = await self._run(request, state, turn, on_text)
+        if not result["text"]:
+            result["text"] = REFUSED if result["stop_reason"] == "refusal" else EMPTY
+            if on_text:
+                await on_text(result["text"])
+        if news:
+            await self._laptop.mark_told([job["id"] for job in news])
+        return result, turn
+
+    async def session_reply(self, session_id: str, said: str, on_text: OnText | None = None) -> dict[str, Any]:
+        """Answer one turn of a session in the glasses app, which lasts until it is ended."""
+        said = " ".join(said.split())
+        if not said:
+            raise BadRequest("Nothing was said")
+        async with self._turn:
+            state = read_state(await self._store.read())
+            self._expire(state["notes"])
+            self._retire_sessions(state)
+            session = state["sessions"].get(session_id)
+            messages = recent([*(session["turns"] if session else []), {"role": "user", "content": said}], SESSION_TURNS)
+            result, turn = await self._answer(state, messages, "", session, said, None, on_text, session=True)
+            state["sessions"][session_id] = {
+                "started": session["started"] if session else self._now().timestamp(),
+                "at": self._now().timestamp(),
+                "turns": recent([*messages, {"role": "assistant", "content": result["text"]}], SESSION_TURNS),
+                "changes": turn["changes"][-MAX_CHANGES:],
+                "laptop_at": turn["laptop_at"],
+            }
+            await self._store.write(state)
+            return result
+
+    async def end_session(self, session_id: str) -> None:
+        """The wearer closed the session: keep it with the earlier conversations."""
+        async with self._turn:
+            state = read_state(await self._store.read())
+            if session_id in state["sessions"]:
+                self._retire_sessions(state, only=session_id)
+                await self._store.write(state)
+
+    async def vocabulary_sources(self) -> list[dict[str, Any]]:
+        """The saved notes, for the speech recognizer's list of names."""
+        return read_state(await self._store.read())["notes"]

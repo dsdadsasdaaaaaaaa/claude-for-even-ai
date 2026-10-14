@@ -18,6 +18,9 @@ DEFAULT_FOLLOWUP = 3
 CONF_NOTES = "notes"
 # Send answers word by word even though the Even app does not ask for it, to see whether it copes.
 CONF_STREAM = "stream_always"
+# Speech to text for sessions from the glasses app.
+CONF_STT_PROVIDER = "stt_provider"
+CONF_STT_KEY = "stt_key"
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_EFFORT = "low"
@@ -43,3 +46,5 @@ LAPTOP_NEXT_PATH = f"{API_BASE}/laptop/next"
 LAPTOP_START_PATH = f"{API_BASE}/laptop/start"
 LAPTOP_WATCH_PATH = f"{API_BASE}/laptop/watch"
 LAPTOP_DONE_PATH = f"{API_BASE}/laptop/done"
+SESSION_TURN_PATH = f"{API_BASE}/session/turn"
+SESSION_END_PATH = f"{API_BASE}/session/end"
