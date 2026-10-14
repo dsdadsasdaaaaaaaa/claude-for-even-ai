@@ -367,24 +367,10 @@ class LaptopDoneView(HomeAssistantView):
 
 SESSION_ID = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 
-# The glasses app runs in a web view inside the Even app, so its requests are cross-site. The key, not a
-# cookie, is what lets a request in, so any origin may make one.
-CORS = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Session-Id",
-    "Access-Control-Max-Age": "86400",
-}
 
-
-def _cors(response: web.StreamResponse) -> web.StreamResponse:
-    response.headers.update(CORS)
-    return response
-
-
-async def _preflight(request: web.Request) -> web.Response:
-    """The browser asking whether the app may make its request."""
-    return web.Response(status=HTTPStatus.NO_CONTENT, headers=CORS)
+def _session_id(request: web.Request) -> str:
+    """The session a request belongs to: in the address, so no custom header has to pass the browser's cross-site check."""
+    return request.query.get("session") or request.headers.get("X-Session-Id", "")
 
 
 class SessionTurnView(HomeAssistantView):
@@ -400,22 +386,22 @@ class SessionTurnView(HomeAssistantView):
     url = SESSION_TURN_PATH
     name = "api:claude_agent:session:turn"
     requires_auth = False
+    # The glasses app runs in a web view inside the Even app, so its requests are cross-site. The key, not a
+    # cookie, is what lets a request in, so Home Assistant may accept them from any origin.
+    cors_allowed = True
 
     def __init__(self, hass: HomeAssistant) -> None:
         self._hass = hass
 
-    async def options(self, request: web.Request) -> web.Response:
-        return await _preflight(request)
-
     async def post(self, request: web.Request) -> web.StreamResponse:
         agent = _agent(self._hass)
         if agent is None:
-            return _cors(_error("The agent is not set up", HTTPStatus.SERVICE_UNAVAILABLE))
+            return _error("The agent is not set up", HTTPStatus.SERVICE_UNAVAILABLE)
         if not agent.authorized(_presented(request)):
-            return _cors(await _refuse())
-        session_id = request.headers.get("X-Session-Id", "")
+            return await _refuse()
+        session_id = _session_id(request)
         if not SESSION_ID.match(session_id):
-            return _cors(_error("The request needs an X-Session-Id header", HTTPStatus.BAD_REQUEST))
+            return _error("The request needs the session's id", HTTPStatus.BAD_REQUEST)
         shared = self._hass.data[DOMAIN]
         started = time.monotonic()
         typed = None
@@ -424,15 +410,15 @@ class SessionTurnView(HomeAssistantView):
             try:
                 body = await request.json()
             except ValueError:
-                return _cors(_error("The request body is not JSON", HTTPStatus.BAD_REQUEST))
+                return _error("The request body is not JSON", HTTPStatus.BAD_REQUEST)
             typed = body.get("text") if isinstance(body, dict) and isinstance(body.get("text"), str) else ""
         else:
             audio = await request.read()
             if len(audio) > speech.MAX_AUDIO_BYTES:
-                return _cors(_error("The recording is too long", HTTPStatus.REQUEST_ENTITY_TOO_LARGE))
+                return _error("The recording is too long", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
 
         response = web.StreamResponse(
-            headers={"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", **CORS}
+            headers={"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
         )
         await response.prepare(request)
         listening = True
@@ -501,24 +487,22 @@ class SessionEndView(HomeAssistantView):
     url = SESSION_END_PATH
     name = "api:claude_agent:session:end"
     requires_auth = False
+    cors_allowed = True
 
     def __init__(self, hass: HomeAssistant) -> None:
         self._hass = hass
 
-    async def options(self, request: web.Request) -> web.Response:
-        return await _preflight(request)
-
     async def post(self, request: web.Request) -> web.Response:
         agent = _agent(self._hass)
         if agent is None:
-            return _cors(_error("The agent is not set up", HTTPStatus.SERVICE_UNAVAILABLE))
+            return _error("The agent is not set up", HTTPStatus.SERVICE_UNAVAILABLE)
         if not agent.authorized(_presented(request)):
-            return _cors(await _refuse())
+            return await _refuse()
         session_id = await _job_id(request)
         if not session_id or not SESSION_ID.match(session_id):
-            return _cors(_error("The request needs the session's id", HTTPStatus.BAD_REQUEST))
+            return _error("The request needs the session's id", HTTPStatus.BAD_REQUEST)
         await agent.end_session(session_id)
-        return _cors(web.json_response({"ok": True}))
+        return web.json_response({"ok": True})
 
 
 def register_views(hass: HomeAssistant) -> None:
