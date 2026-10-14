@@ -77,7 +77,6 @@ def read_jobs(raw: Any) -> tuple[list[Job], float | None]:
             "finished": _time(job.get("finished")),
             "result": job["result"] if isinstance(job.get("result"), str) else "",
             "lost": job.get("lost") is True,
-            "told": job.get("told") is True,
             "stats": _stats(job.get("stats")),
         }
         for job in (stored if isinstance(stored, list) else [])
@@ -168,7 +167,6 @@ class Laptop:
                 "finished": None,
                 "result": "",
                 "lost": False,
-                "told": False,
                 "stats": {},
             }
             self._jobs.append(job)
@@ -238,32 +236,9 @@ class Laptop:
             if job is None or not (job["status"] == RUNNING or (job["status"] == FAILED and job["lost"])):
                 return False
             job["stats"] = _stats(stats)
-            # A late report replaces the "stopped" message they may already have heard about.
-            job["told"] = False
             await self._end(job, DONE if ok else FAILED, " ".join(result.split()) or ("Done." if ok else "It did not work."))
             await self._save()
             return True
-
-    async def untold(self, within: float) -> list[Job]:
-        """Jobs that ended in the last `within` seconds that the wearer has not heard about yet, oldest first."""
-        async with self._lock:
-            await self._load()
-            if await self._tidy():
-                await self._save()
-            since = self._now() - within
-            return [dict(job) for job in self._jobs if job["status"] in (DONE, FAILED, EXPIRED) and not job["told"] and (job["finished"] or 0) >= since]
-
-    async def mark_told(self, ids: list[str]) -> None:
-        """The wearer has now heard how these went."""
-        async with self._lock:
-            await self._load()
-            changed = False
-            for job in self._jobs:
-                if job["id"] in ids and not job["told"]:
-                    job["told"] = True
-                    changed = True
-            if changed:
-                await self._save()
 
     async def watch(self, job_id: str, wait: float) -> str | None:
         """The laptop, while working, waiting up to `wait` seconds to hear whether the job was called off. Returns its status."""

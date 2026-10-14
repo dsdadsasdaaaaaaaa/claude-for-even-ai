@@ -40,7 +40,7 @@ LAPTOP_INSTRUCTIONS = """You can also get things done on their Windows laptop wi
 
 The laptop does not see this conversation, so write the job as a complete instruction: what they want to end up with rather than which buttons to press, with every name and detail it needs. Mark it as a follow-up only when it carries on from the job you just sent, such as "now close it".
 
-When you send a job, tell them in a few words what is about to happen ("Opening your history essay on the laptop."), so they can catch a mishearing. It is not done yet, so never say it is. If they say stop or cancel about it, call it off with cancel_laptop_job. When it finishes, the outcome goes to their phone as a notification. When they ask how a job went, check with laptop_status."""
+When you send a job, tell them in a few words what is about to happen ("Opening your history essay on the laptop."), so they can catch a mishearing. It is not done yet, so never say it is. If they say stop or cancel about it, call it off with cancel_laptop_job. When it finishes, the outcome goes to their phone as a notification, so do not bring up how a job went unless they ask; when they do, check with laptop_status."""
 
 REMEMBER = {
     "name": "remember",
@@ -150,8 +150,6 @@ LAPTOP_JOBS_SHOWN = 6
 LAPTOP_RESULT_CHARS = 600
 # Without the laptop being mentioned, a job is only sent this soon after the last one, as a follow-on.
 LAPTOP_FOLLOW_SECONDS = 5 * 60
-# A job that finished this recently, and that they have not heard about, is mentioned once in the next answer.
-LAPTOP_NEWS_SECONDS = 15 * 60
 # A session in the glasses app keeps this much of itself, and is put away after this long untouched.
 SESSION_TURNS = 40
 SESSION_IDLE_SECONDS = 4 * 60 * 60
@@ -213,10 +211,6 @@ class Laptop(Protocol):
     async def cancel(self) -> list[dict[str, Any]]: ...
 
     async def recent(self, within: float) -> list[dict[str, Any]]: ...
-
-    async def untold(self, within: float) -> list[dict[str, Any]]: ...
-
-    async def mark_told(self, ids: list[str]) -> None: ...
 
 
 class BadRequest(Exception):
@@ -512,20 +506,6 @@ class Agent:
             used += len(line) + 1
         return "Your saved notes about them, oldest first:\n" + "\n".join(lines)
 
-    def _news_block(self, news: list[dict[str, Any]]) -> str:
-        """Laptop jobs that ended since they last heard, to be mentioned once."""
-        words = {"done": "finished", "failed": "did not work out", "expired": "was dropped because the laptop was not on in time"}
-        lines = [
-            f'- "{job["task"]}" {words.get(job["status"], job["status"])} at {self._when(job["finished"] or job["at"])}.'
-            + (f" Outcome: {job['result'][:LAPTOP_RESULT_CHARS]}" if job["result"] else "")
-            for job in news
-        ]
-        return (
-            "Laptop jobs that ended since they last heard about them:\n"
-            + "\n".join(lines)
-            + "\nStart your reply by telling them in a few words how it went, then answer what they asked."
-        )
-
     def _build_request(
         self,
         messages: list[Message],
@@ -533,7 +513,6 @@ class Agent:
         notes: list[dict[str, Any]],
         changes: list[dict[str, str]],
         since: float | None,
-        news: list[dict[str, Any]] | None = None,
         session: bool = False,
     ) -> dict[str, Any]:
         now = self._now()
@@ -543,8 +522,6 @@ class Agent:
             live += f"\n\n{SESSION_NOTE}"
         elif since is not None:
             live += f" Their last message in this conversation was {ago(since)} ago."
-        if news:
-            live += f"\n\n{self._news_block(news)}"
         if changes:
             # Earlier turns are kept as words only, so without this Claude would see itself
             # saying "saved" or "forgotten" with nothing to show that it really happened.
@@ -672,8 +649,6 @@ class Agent:
         else:
             lines = [f"Their laptop is off or asleep; it was last on at {self._when(self._laptop.seen)}. A job waits up to 12 hours for it."]
         jobs = (await self._laptop.recent(LAPTOP_SECONDS))[-LAPTOP_JOBS_SHOWN:]
-        # They are hearing how these went now, so they need not be mentioned again.
-        await self._laptop.mark_told([job["id"] for job in jobs if job["status"] in ("done", "failed", "expired")])
         if not jobs:
             lines.append("No laptop jobs in the last day.")
         else:
@@ -872,15 +847,12 @@ class Agent:
             "latest": latest,
             "laptop_at": thread["laptop_at"] if thread else None,
         }
-        news = await self._laptop.untold(LAPTOP_NEWS_SECONDS) if self._laptop else []
-        request = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, news, session)
+        request = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, session)
         result = await self._run(request, state, turn, on_text)
         if not result["text"]:
             result["text"] = REFUSED if result["stop_reason"] == "refusal" else EMPTY
             if on_text:
                 await on_text(result["text"])
-        if news:
-            await self._laptop.mark_told([job["id"] for job in news])
         return result, turn
 
     async def session_reply(self, session_id: str, said: str, on_text: OnText | None = None) -> dict[str, Any]:
