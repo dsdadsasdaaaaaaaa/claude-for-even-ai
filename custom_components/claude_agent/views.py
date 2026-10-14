@@ -461,6 +461,8 @@ class SessionTurnView(HomeAssistantView):
                 said = " ".join(typed.split())
             heard_at = time.monotonic()
             await send({"type": "heard", "text": said})
+            # What was heard is kept with the last few requests, so the speech recognizer's mistakes can be seen and fixed.
+            kind["heard"] = said
             if not said:
                 note("connection check" if typed == "" else "nothing heard", **kind)
             else:
