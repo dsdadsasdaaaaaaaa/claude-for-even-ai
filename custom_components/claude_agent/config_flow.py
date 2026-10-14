@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -29,7 +30,7 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 
-from .agent import edited_notes, notes_text, read_state
+from .agent import apply_note_edits, notes_text, read_state
 from .const import (
     CHAT_PATH,
     CONF_EFFORT,
@@ -37,6 +38,8 @@ from .const import (
     CONF_LAPTOP,
     CONF_LAPTOP_TOKEN,
     CONF_MODEL,
+    CONF_NEW_LAPTOP_TOKEN,
+    CONF_NEW_TOKEN,
     CONF_NOTES,
     CONF_NOTIFY,
     CONF_PROFILE,
@@ -174,6 +177,19 @@ class ClaudeAgentConfigFlow(ConfigFlow, domain=DOMAIN):
             description_placeholders={"endpoint": endpoint(self.hass), "token": self._data[CONF_TOKEN]},
         )
 
+    async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None):
+        """Replace the Anthropic key, keeping everything else, the Even app's key and the laptop's included."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            api_key = (user_input.get(CONF_API_KEY) or "").strip()
+            problem = await check_key(self.hass, api_key) if api_key else "no_key"
+            if problem is None:
+                return self.async_update_reload_and_abort(entry, data_updates={CONF_API_KEY: api_key})
+            errors["base"] = problem
+        box = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
+        return self.async_show_form(step_id="reconfigure", data_schema=vol.Schema({vol.Required(CONF_API_KEY): box}), errors=errors)
+
     @staticmethod
     @callback
     def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
@@ -185,17 +201,33 @@ class ClaudeAgentOptionsFlow(OptionsFlow):
 
     def __init__(self, config_entry: ConfigEntry) -> None:
         self._entry = config_entry
+        # The notes as the box showed them, so only the lines changed in it are applied.
+        self._notes_shown = ""
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
         memory = shared_memory(self.hass)
         if user_input is not None:
-            # The notes belong to the agent's memory, not the settings; an emptied box clears them.
-            state = read_state(await memory.read())
-            state["notes"] = edited_notes(user_input.pop(CONF_NOTES, "") or "", state["notes"], time.time())
-            await memory.write(state)
+            # The notes belong to the agent's memory, not the settings; an emptied box clears them. Only the lines
+            # changed in the box are applied, under the agent's own lock, so a note Claude saved or removed while
+            # this screen was open is kept as it is.
+            submitted = user_input.pop(CONF_NOTES, "") or ""
+            lock = self.hass.data.setdefault(DOMAIN, {}).setdefault("turn_lock", asyncio.Lock())
+            async with lock:
+                state = read_state(await memory.read())
+                state["notes"] = apply_note_edits(self._notes_shown, submitted, state["notes"], time.time())
+                await memory.write(state)
+            # A key that may have got out is replaced; the reload that follows saving uses the new one.
+            renewed = {}
+            if user_input.pop(CONF_NEW_TOKEN, False):
+                renewed[CONF_TOKEN] = secrets.token_urlsafe(32)
+            if user_input.pop(CONF_NEW_LAPTOP_TOKEN, False):
+                renewed[CONF_LAPTOP_TOKEN] = secrets.token_urlsafe(32)
+            if renewed:
+                self.hass.config_entries.async_update_entry(self._entry, data={**self._entry.data, **renewed})
             return self.async_create_entry(title="", data=user_input)
 
         notes = read_state(await memory.read())["notes"]
+        self._notes_shown = notes_text(notes)
         current = self._entry.options
         targets = phones(self.hass)
         # A phone chosen earlier stays selectable even while its app is not connected.
@@ -209,7 +241,7 @@ class ClaudeAgentOptionsFlow(OptionsFlow):
                 vol.Required(CONF_FOLLOWUP, default=current.get(CONF_FOLLOWUP, DEFAULT_FOLLOWUP)): NumberSelector(
                     NumberSelectorConfig(min=1, max=60, step=1, mode=NumberSelectorMode.BOX, unit_of_measurement="min")
                 ),
-                vol.Optional(CONF_NOTES, description={"suggested_value": notes_text(notes)}): TextSelector(TextSelectorConfig(multiline=True)),
+                vol.Optional(CONF_NOTES, description={"suggested_value": self._notes_shown}): TextSelector(TextSelectorConfig(multiline=True)),
                 vol.Required(CONF_STREAM, default=current.get(CONF_STREAM, False)): BooleanSelector(),
                 vol.Required(CONF_STT_PROVIDER, default=current.get(CONF_STT_PROVIDER, DEFAULT_PROVIDER)): _choices(
                     {name: preset["label"] for name, preset in PROVIDERS.items()}
@@ -219,6 +251,8 @@ class ClaudeAgentOptionsFlow(OptionsFlow):
                 ),
                 vol.Required(CONF_LAPTOP, default=current.get(CONF_LAPTOP, True)): BooleanSelector(),
                 vol.Required(CONF_NOTIFY, default=notify): _choices(targets),
+                vol.Required(CONF_NEW_TOKEN, default=False): BooleanSelector(),
+                vol.Required(CONF_NEW_LAPTOP_TOKEN, default=False): BooleanSelector(),
             }
         )
         return self.async_show_form(

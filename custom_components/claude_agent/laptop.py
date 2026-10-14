@@ -28,6 +28,8 @@ OFFER_SECONDS = 60
 # The helper gives up on a job after 20 minutes; past this it is not coming back.
 RUN_SECONDS = 25 * 60
 MAX_JOBS = 20
+# The same job asked for again this soon after it started is the same request arriving twice, not a new one.
+REPEAT_SECONDS = 60
 MAX_TASK_CHARS = 4000
 MAX_RESULT_CHARS = 2000
 
@@ -152,10 +154,22 @@ class Laptop:
         return self.seen is not None and self._now() - self.seen < ONLINE_SECONDS
 
     async def submit(self, task: str, *, follow_up: bool = False) -> Job:
-        """Queue a job and return it. A follow-up carries on from the laptop's previous job."""
+        """Queue a job and return it. A follow-up carries on from the laptop's previous job.
+
+        The same job asked for again while it waits, or within a minute of starting, is not queued a second time:
+        the existing one comes back with "repeat" set.
+        """
         async with self._lock:
             await self._load()
             await self._tidy()
+            wanted = " ".join(task[:MAX_TASK_CHARS].lower().split())
+            for queued in self._jobs:
+                if (
+                    " ".join(queued["task"].lower().split()) == wanted
+                    and queued["follow_up"] == follow_up
+                    and (queued["status"] in (WAITING, OFFERED) or (queued["status"] == RUNNING and self._now() - (queued["started"] or queued["at"]) < REPEAT_SECONDS))
+                ):
+                    return {**queued, "repeat": True}
             job: Job = {
                 "id": secrets.token_hex(6),
                 "task": task[:MAX_TASK_CHARS],
@@ -262,14 +276,14 @@ class Laptop:
             except TimeoutError:
                 pass
 
-    async def cancel(self) -> list[Job]:
+    async def cancel(self, reason: str = "Called off from the glasses.") -> list[Job]:
         """Call off every job that has not finished. Returns the ones called off."""
         async with self._lock:
             await self._load()
             cancelled = []
             for job in self._jobs:
                 if job["status"] in UNFINISHED:
-                    await self._end(job, CANCELLED, "Called off from the glasses.")
+                    await self._end(job, CANCELLED, reason)
                     cancelled.append(dict(job))
             if cancelled:
                 await self._save()

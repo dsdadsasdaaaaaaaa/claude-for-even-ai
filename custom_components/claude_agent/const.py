@@ -21,6 +21,9 @@ CONF_STREAM = "stream_always"
 # Speech to text for sessions from the glasses app.
 CONF_STT_PROVIDER = "stt_provider"
 CONF_STT_KEY = "stt_key"
+# Ticked under Configure to replace a key that may have got out; not kept in the settings.
+CONF_NEW_TOKEN = "new_even_key"
+CONF_NEW_LAPTOP_TOKEN = "new_laptop_key"
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_EFFORT = "low"

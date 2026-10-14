@@ -7,6 +7,7 @@ so the settings screen and the agent never hold different copies.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -16,16 +17,25 @@ from .const import DOMAIN
 
 
 class Memory:
-    """Something kept in Home Assistant's own storage."""
+    """Something kept in Home Assistant's own storage.
+
+    What was last read or written is kept in memory too, so a question does not
+    read the whole file from disk again; every caller gets its own copy to change.
+    """
 
     def __init__(self, hass: HomeAssistant, name: str) -> None:
         self._store: Store[dict[str, Any]] = Store(hass, 1, f"{DOMAIN}.{name}", private=True)
+        self._kept: str | None = None
 
     async def read(self) -> Any:
-        return await self._store.async_load()
+        if self._kept is None:
+            self._kept = json.dumps(await self._store.async_load())
+        return json.loads(self._kept)
 
     async def write(self, state: dict[str, Any]) -> None:
-        await self._store.async_save(state)
+        kept = json.dumps(state)
+        await self._store.async_save(json.loads(kept))
+        self._kept = kept
 
 
 def shared_memory(hass: HomeAssistant, name: str = "memory") -> Memory:

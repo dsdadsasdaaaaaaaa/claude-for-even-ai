@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable, Coroutine
-import hmac
 from http import HTTPStatus
 import json
 import logging
@@ -26,7 +25,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from . import speech
-from .agent import FAILED, LIMIT, NO_USAGE, Agent, BadRequest, chunk, completion, convert_messages, new_id, over_limit
+from .agent import NO_USAGE, Agent, AnswerStopped, BadRequest, chunk, completion, convert_messages, new_id, problem_text, same_key
 from .const import (
     API_BASE,
     CHAT_PATH,
@@ -52,6 +51,11 @@ TIMINGS_KEPT = 30
 LAPTOP_WAIT = 15
 SESSION_REQUESTS_KEPT = 10
 SESSION_LOG_KEPT = 150
+# While a session turn is being answered, a comment is sent this often, so a slow answer can be told from a dead connection.
+KEEPALIVE_SECONDS = 10
+# Request details kept word for word in the diagnostics; anything else is only noted as present.
+SHOWN_HEADERS = {"user-agent", "content-type", "accept", "accept-encoding", "content-length"}
+SHOWN_FIELDS = {"model", "stream", "temperature", "max_tokens", "stream_options"}
 
 
 def _agent(hass: HomeAssistant) -> Agent | None:
@@ -103,11 +107,13 @@ def _outline(request: web.Request, body: dict[str, Any]) -> dict[str, Any]:
     tools = body.get("tools")
     return {
         "at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "headers": {
-            name: ("(present)" if name.lower() in ("authorization", "x-api-key", "api-key", "cookie") else value)
-            for name, value in request.headers.items()
+        # Only harmless headers word for word: others can carry the remote address, a device or an account.
+        "headers": {name: (value if name.lower() in SHOWN_HEADERS else "(present)") for name, value in request.headers.items()},
+        "fields": {
+            name: (value if name in SHOWN_FIELDS else type(value).__name__)
+            for name, value in body.items()
+            if name not in ("messages", "tools") and isinstance(value, (str, int, float, bool, dict))
         },
-        "fields": {name: value for name, value in body.items() if name not in ("messages", "tools") and isinstance(value, (str, int, float, bool))},
         "messages": [
             {
                 "role": message.get("role"),
@@ -206,6 +212,8 @@ class ChatView(HomeAssistantView):
                     "claude_requests": stats.get("requests", 0),
                     "web_searches": stats.get("searches", 0),
                     "tools": stats.get("tools", []),
+                    "cache_read": stats.get("cache_read", 0),
+                    "cache_written": stats.get("cache_written", 0),
                     "stop": (result or {}).get("stop_reason", ""),
                     "error": error,
                 }
@@ -228,10 +236,9 @@ class ChatView(HomeAssistantView):
             except Exception as err:  # noqa: BLE001 - whatever went wrong, the app needs an answer
                 _LOGGER.warning("Claude could not be reached: %s", err)
                 record(None, None, type(err).__name__)
-                if over_limit(err):
-                    # Trying again will not help here, so the wearer is told what will.
-                    return web.json_response(completion(completion_id, created, agent.model, LIMIT, NO_USAGE))
-                return _error("The assistant could not be reached", HTTPStatus.BAD_GATEWAY)
+                # A sentence the glasses can show, saying what to do about it, rather than an error the Even app
+                # shows its own way, if at all.
+                return web.json_response(completion(completion_id, created, agent.model, problem_text(err), NO_USAGE))
             record(result, None)
             return web.json_response(completion(completion_id, created, agent.model, result["text"], result["usage"]))
 
@@ -266,7 +273,7 @@ class ChatView(HomeAssistantView):
             _LOGGER.warning("Claude could not be reached: %s", err)
             record(None, first_text, type(err).__name__)
             if not sent:
-                await send(chunk(completion_id, created, agent.model, {"content": LIMIT if over_limit(err) else FAILED}))
+                await send(chunk(completion_id, created, agent.model, {"content": problem_text(err)}))
             await send(chunk(completion_id, created, agent.model, {}, "stop"))
         else:
             record(result, first_text)
@@ -286,7 +293,7 @@ def _laptop(hass: HomeAssistant, request: web.Request) -> Laptop | None:
     """The job queue, when the laptop is switched on and presented the right key."""
     shared = hass.data.get(DOMAIN, {})
     token = shared.get("laptop_token") or ""
-    if not token or not hmac.compare_digest(_presented(request).encode(), token.encode()):
+    if not token or not same_key(_presented(request), token):
         return None
     return shared.get("laptop")
 
@@ -307,15 +314,15 @@ class LaptopNextView(HomeAssistantView):
             return await _refuse()
         if request.query.get("check"):
             # The helper's setup making sure it has the right address and key, without taking a job.
-            return web.Response(status=HTTPStatus.NO_CONTENT)
+            return web.Response(status=HTTPStatus.NO_CONTENT, headers=WAIT_HEADER)
         if not self._hass.data[DOMAIN].get("laptop_on"):
             # Switched off under Configure: the helper is told to wait, and nothing is handed out.
             await asyncio.sleep(LAPTOP_WAIT)
-            return web.Response(status=HTTPStatus.NO_CONTENT)
+            return web.Response(status=HTTPStatus.NO_CONTENT, headers=WAIT_HEADER)
         job = await laptop.next(LAPTOP_WAIT)
         if job is None:
-            return web.Response(status=HTTPStatus.NO_CONTENT)
-        return web.json_response({"id": job["id"], "task": job["task"], "follow_up": job["follow_up"]})
+            return web.Response(status=HTTPStatus.NO_CONTENT, headers=WAIT_HEADER)
+        return web.json_response({"id": job["id"], "task": job["task"], "follow_up": job["follow_up"]}, headers=WAIT_HEADER)
 
 
 async def _job_id(request: web.Request) -> str | None:
@@ -365,7 +372,7 @@ class LaptopWatchView(HomeAssistantView):
         status = await laptop.watch(request.query.get("id", ""), LAPTOP_WAIT)
         if status is None:
             return _error("No such job", HTTPStatus.NOT_FOUND)
-        return web.json_response({"status": status})
+        return web.json_response({"status": status}, headers=WAIT_HEADER)
 
 
 class LaptopDoneView(HomeAssistantView):
@@ -395,6 +402,10 @@ class LaptopDoneView(HomeAssistantView):
 
 
 SESSION_ID = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+
+
+# Tells the helper how long a request is held open, so it can tell a dropped connection from a quiet one sooner.
+WAIT_HEADER = {"X-Laptop-Wait": str(LAPTOP_WAIT)}
 
 
 def _session_id(request: web.Request) -> str:
@@ -464,23 +475,35 @@ class SessionTurnView(HomeAssistantView):
         )
         await response.prepare(request)
         listening = True
+        writing = asyncio.Lock()
 
-        async def send(event: dict[str, Any]) -> None:
+        async def write(data: bytes) -> None:
             nonlocal listening
             if not listening:
                 return
             try:
-                await response.write(f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n".encode())
+                async with writing:
+                    await response.write(data)
             except (ConnectionError, RuntimeError):
                 listening = False  # The app stopped listening.
 
+        async def send(event: dict[str, Any]) -> None:
+            await write(f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n".encode())
+
+        async def keepalive() -> None:
+            # A comment line, which the app's reader skips; it only shows that the connection is alive.
+            while listening:
+                await asyncio.sleep(KEEPALIVE_SECONDS)
+                await write(b": keepalive\n\n")
+
+        beating = asyncio.create_task(keepalive())
         heard_at = None
         first_text: float | None = None
         try:
             if typed is None:
                 words = speech.vocabulary(agent.profile, await agent.vocabulary_sources())
                 said = await speech.transcribe(async_get_clientsession(self._hass), shared.get("stt_provider", ""), shared.get("stt_key", ""), audio, words)
-                if speech.probably_silence(said, audio):
+                if speech.probably_silence(said, audio, words):
                     said = ""
             else:
                 said = " ".join(typed.split())
@@ -490,10 +513,16 @@ class SessionTurnView(HomeAssistantView):
             kind["heard"] = said
             if not said:
                 note("connection check" if typed == "" else "nothing heard", **kind)
+                if typed == "" and not shared.get("stt_key"):
+                    # The app's connection check: it reached Home Assistant, but holding the ring would fail.
+                    await send({"type": "error", "message": "No speech-to-text key is set under Configure"})
             else:
 
                 async def on_text(delta: str) -> None:
                     nonlocal first_text
+                    if not listening:
+                        # Nobody is reading: stop Claude writing an answer no one will see.
+                        raise AnswerStopped
                     first_text = first_text or time.monotonic()
                     await send({"type": "text", "text": delta})
 
@@ -509,18 +538,25 @@ class SessionTurnView(HomeAssistantView):
                         "claude_requests": stats.get("requests", 0),
                         "web_searches": stats.get("searches", 0),
                         "tools": stats.get("tools", []),
+                        "cache_read": stats.get("cache_read", 0),
+                        "cache_written": stats.get("cache_written", 0),
                         "stop": result.get("stop_reason", ""),
                         "error": "",
                     }
                 )
-                note("answered", **kind)
+                note("app stopped listening" if result.get("stopped") else "answered", **kind)
         except speech.SpeechError as err:
             note(f"speech-to-text: {err}", **kind)
             await send({"type": "error", "message": str(err)})
+        except asyncio.CancelledError:
+            note("app went away", **kind)
+            raise
         except Exception as err:  # noqa: BLE001 - whatever went wrong, the glasses get a line to show
             _LOGGER.warning("A session turn failed: %s", err)
             note(f"failed: {type(err).__name__}", **kind)
-            await send({"type": "error", "message": LIMIT if over_limit(err) else FAILED})
+            await send({"type": "error", "message": problem_text(err)})
+        finally:
+            beating.cancel()
         await send({"type": "done"})
         if listening:
             try:

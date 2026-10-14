@@ -9,8 +9,13 @@ Nothing here knows about Home Assistant, so it can be tested on its own.
 
 from __future__ import annotations
 
+from array import array
+import logging
+import math
 import re
 from typing import Any
+
+_LOGGER = logging.getLogger(__name__)
 
 PROVIDERS = {
     # The full model, not the turbo one: a little slower, noticeably better with names and accents.
@@ -23,15 +28,19 @@ MAX_VOCABULARY_CHARS = 700
 # A recording longer than this is turned down before it is sent anywhere.
 MAX_AUDIO_BYTES = 4 * 1024 * 1024
 
-MISHEAR_LINE = re.compile(r"words you might mishear:?\s*(.+)", re.IGNORECASE)
-# In that line, how a word sounds and what it gets misheard as are quoted; the real word is not.
-QUOTED = re.compile(r"[\"“”][^\"“”]*[\"“”]|‘[^’]*’")
-# The words that tie the parts of an entry together: "Kinneret, said ..., may become ... or ...".
+MISHEAR_LABEL = re.compile(r"words you might mishear\s*:?", re.IGNORECASE)
+# The next "Something:" heading, which ends the list.
+NEXT_LABEL = re.compile(r"^\s*[A-Z][\w ]{0,40}:(\s|$)")
+# How a word sounds and what it gets misheard as are quoted, or in brackets; the real word is not.
+QUOTED = re.compile(r"[\"“”][^\"“”]*[\"“”]|‘[^’]*’|(?<!\w)'[^']*'(?!\w)|\([^)]*\)")
+# The words that tie the parts of an entry together: "Name, said "naym", may become "Nam" or ...".
 JOINERS = re.compile(
     r"\b(said|says|pronounced|sounds?(\s+like)?|may|might|can|could|often|usually|becomes?|comes?\s+out(\s+as)?"
-    r"|turns?\s+into|heard\s+as|written\s+as|spel(led|t)(\s+as)?|or|as|like|and)\b",
+    r"|turns?\s+into|heard\s+as|written\s+as|spel(led|t)(\s+as)?|or|as|like)\b",
     re.IGNORECASE,
 )
+# A list marker at the start of a line.
+BULLET = re.compile(r"^\s*(?:[-•*]|\d+[.)])\s+")
 
 
 class SpeechError(Exception):
@@ -51,10 +60,35 @@ def seconds_of(audio: bytes) -> float:
     return max(0, len(audio) - 44) / 32000
 
 
-def probably_silence(text: str, audio: bytes) -> bool:
-    """Whether the words are what Whisper makes of a recording with nobody talking: a press too short, or a stock phrase."""
+# Louder than this somewhere in the recording, someone was talking to the glasses, so even "Okay" was really said.
+SPOKEN_LOUDNESS = 0.08
+
+
+def loudness(audio: bytes) -> float:
+    """The loudest tenth of a second in a 16-bit WAV recording, from 0 to 1 (the same measure as the app's)."""
+    samples = array("h")
+    body = audio[44:]
+    samples.frombytes(body[: len(body) // 2 * 2])
+    window = 1600
+    loudest = 0.0
+    for start in range(0, len(samples), window):
+        part = samples[start : start + window : 4]
+        if part:
+            loudest = max(loudest, math.sqrt(sum(sample * sample for sample in part) / len(part)) / 32768)
+    return loudest
+
+
+def probably_silence(text: str, audio: bytes, hints: str = "") -> bool:
+    """Whether the words are what Whisper makes of a recording with nobody talking to it: a press too short, a stock
+    phrase from a quiet recording, or the list of names it was given, read back."""
     words = " ".join(re.sub(r"[^\w\s']", " ", text.lower()).split())
-    return seconds_of(audio) < 0.5 or (words in SILENCE_WORDS and seconds_of(audio) < 4)
+    if seconds_of(audio) < 0.5:
+        return True
+    if words in SILENCE_WORDS and seconds_of(audio) < 4:
+        return words == "" or loudness(audio) < SPOKEN_LOUDNESS
+    hint_words = set(re.findall(r"[\w']+", hints.lower()))
+    said = words.split()
+    return len(said) >= 3 and all(word in hint_words for word in said)
 
 
 def _fit(terms: list[str]) -> str:
@@ -67,23 +101,58 @@ def _fit(terms: list[str]) -> str:
     return ", ".join(kept)
 
 
+def _mishear_entries(profile: str) -> list[str] | None:
+    """The entries of the profile's "Words you might mishear" list, on one line or as a list under it; None without one."""
+    found = MISHEAR_LABEL.search(profile)
+    if not found:
+        return None
+    lines: list[str] = []
+    for index, line in enumerate(profile[found.end() :].splitlines()):
+        if index > 0 and (not line.strip() or NEXT_LABEL.match(line)):
+            if lines:
+                break
+            continue
+        lines.append(BULLET.sub("", line))
+    entries: list[str] = []
+    for line in lines:
+        entries += [entry for entry in re.split(r"[;\n]", line) if entry.strip()]
+    return entries
+
+
+def _names(entry: str) -> list[str]:
+    """The real words in one entry. One that says how a word sounds or what it becomes names only that word, before
+    its first comma, bracket or joining word; one that does not is a plain list."""
+    plain = QUOTED.sub(" ", entry)
+    if JOINERS.search(plain):
+        first = re.split(r"[,(\"“‘]", entry, maxsplit=1)[0]
+        pieces = [JOINERS.split(first, maxsplit=1)[0]]
+    else:
+        pieces = plain.split(",")
+    names = []
+    for piece in pieces:
+        # A full stop ends the list, but not one inside a name such as "Mr. Abrams" or "Node.js".
+        term = " ".join(re.sub(r"(?<![A-Z][a-z])(?<!\b[A-Z])\.(?=\s|$)", " ", piece).split()).strip(" '’-:")
+        if term and any(c.isalpha() for c in term) and len(term) <= 40:
+            names.append(term)
+    return names
+
+
 def vocabulary(profile: str, notes: list[dict[str, Any]]) -> str:
     """The names and words to steer recognition toward, spelled right, and nothing else.
 
-    From the profile's "Words you might mishear" line when it has one, keeping
-    only the real words: the line also spells out how each sounds and what it
+    From the profile's "Words you might mishear" list when it has one, keeping
+    only the real words: the list also spells out how each sounds and what it
     gets misheard as, and handing the recognizer those would steer it toward
-    the very mistakes the line warns about. Otherwise, the capitalised names in
+    the very mistakes the list warns about. Otherwise, the capitalised names in
     the profile and notes.
     """
-    found = MISHEAR_LINE.search(profile)
     terms: list[str] = []
-    if found:
-        text = JOINERS.sub(",", QUOTED.sub(",", found.group(1)))
-        for piece in re.split(r"[,;.:]", text):
-            term = " ".join(piece.split()).strip(" '’-")
-            if term and any(c.isalpha() for c in term) and len(term) <= 40 and term.lower() not in (t.lower() for t in terms):
-                terms.append(term)
+    entries = _mishear_entries(profile)
+    if entries:
+        for entry in entries:
+            for term in _names(entry):
+                if term.lower() not in (known.lower() for known in terms):
+                    terms.append(term)
         if terms:
             return _fit(terms)
     text = " ".join([profile, *(note["text"] for note in notes)])
@@ -129,14 +198,27 @@ async def transcribe(http: Any, provider: str, key: str, audio: bytes, words: st
             headers={"Authorization": f"Bearer {key}"},
             timeout=aiohttp.ClientTimeout(total=30),
         ) as response:
-            body = await response.json(content_type=None)
-            if response.status in (401, 403):
-                raise SpeechError("The speech-to-text key was turned down")
-            if response.status >= 400:
-                detail = body.get("error") if isinstance(body, dict) else None
-                message = detail.get("message") if isinstance(detail, dict) else detail
-                raise SpeechError(str(message or f"The speech service answered {response.status}"))
+            try:
+                body = await response.json(content_type=None)
+            except ValueError:
+                # An error page, or something else that is not the answer.
+                body = None
+            status = response.status
     except (aiohttp.ClientError, TimeoutError) as err:
         raise SpeechError("Could not reach the speech service") from err
-    text = body.get("text") if isinstance(body, dict) else None
+    if status >= 400:
+        detail = body.get("error") if isinstance(body, dict) else None
+        message = detail.get("message") if isinstance(detail, dict) else detail
+        # The service's own words go to the log; the glasses get a sentence that fits on them.
+        _LOGGER.warning("The speech service answered %s: %s", status, message or "(no message)")
+        if status in (401, 403):
+            raise SpeechError("The speech-to-text key was turned down")
+        if status == 413:
+            raise SpeechError("The recording is too long")
+        if status == 429:
+            raise SpeechError("Speech-to-text is over its limit for now. Try again in a minute.")
+        raise SpeechError("The speech service is having trouble. Try again.")
+    if not isinstance(body, dict):
+        raise SpeechError("The speech service sent back something unreadable")
+    text = body.get("text")
     return text.strip() if isinstance(text, str) else ""

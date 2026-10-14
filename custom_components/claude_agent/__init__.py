@@ -7,6 +7,7 @@ Claude API, and goes back to the glasses.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from functools import partial
 import logging
@@ -68,6 +69,8 @@ def make_ask(client: anthropic.AsyncAnthropic) -> Callable[[dict[str, Any], Call
         if request["fallback"]:
             extra_body["fallbacks"] = "default"
             options["betas"] = [FALLBACK_BETA]
+        if request.get("tool_choice"):
+            options["tool_choice"] = request["tool_choice"]
         async with client.beta.messages.stream(
             model=request["model"],
             max_tokens=request["max_tokens"],
@@ -90,26 +93,59 @@ def make_ask(client: anthropic.AsyncAnthropic) -> Callable[[dict[str, Any], Call
             "content": message.content,
             "tool_calls": [{"id": block.id, "name": block.name, "input": block.input} for block in message.content if block.type == "tool_use"],
             "searches": sum(1 for block in message.content if block.type == "server_tool_use"),
-            "usage": {"input_tokens": message.usage.input_tokens, "output_tokens": message.usage.output_tokens},
+            "usage": {
+                "input_tokens": message.usage.input_tokens,
+                "output_tokens": message.usage.output_tokens,
+                # What the prompt cache saved and what it stored, so the diagnostics show whether it works.
+                "cache_read_input_tokens": getattr(message.usage, "cache_read_input_tokens", None) or 0,
+                "cache_creation_input_tokens": getattr(message.usage, "cache_creation_input_tokens", None) or 0,
+            },
         }
 
     return ask
 
 
-def notifier(hass: HomeAssistant, service: str) -> Callable[[dict[str, Any]], Awaitable[None]]:
-    """How the wearer hears that a laptop job ended: a notification on their phone, which the glasses can show."""
+def first_phone(hass: HomeAssistant) -> str | None:
+    """The phone that Configure offers first, used until a choice is saved there."""
+    phones = sorted(name for name in hass.services.async_services().get("notify", {}) if name.startswith("mobile_app_"))
+    return phones[0] if phones else None
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def notifier(hass: HomeAssistant, chosen: str | None) -> Callable[[dict[str, Any]], Awaitable[None]]:
+    """How the wearer hears that a laptop job ended: a notification on their phone, which the glasses can show.
+
+    `chosen` is the service picked under Configure, or None when nothing was saved there yet.
+    """
     titles = {DONE: "Laptop: done", FAILED: "Laptop: didn't work", EXPIRED: "Laptop: job dropped"}
 
     async def notify(job: dict[str, Any]) -> None:
-        if service == NO_NOTIFY or not hass.services.has_service("notify", service):
+        service = chosen if chosen is not None else first_phone(hass)
+        if service is None or service == NO_NOTIFY:
             return
-        message = job["result"] if len(job["result"]) <= NOTIFY_CHARS else job["result"][: NOTIFY_CHARS - 1].rstrip() + "…"
+        if not hass.services.has_service("notify", service):
+            # The phone app was signed out or renamed: say so, since this is the only way they hear how a job went.
+            _LOGGER.warning("The laptop's result was not sent: notify.%s is not available", service)
+            return
+        text = job["result"]
+        if job["status"] != DONE:
+            # Messages written for the job, rather than by Claude, need to say which job they are about.
+            text = f'"{_cut(" ".join(job["task"].split()), 80)}": {text}'
         try:
-            await hass.services.async_call("notify", service, {"title": titles.get(job["status"], "Laptop"), "message": message})
+            await hass.services.async_call("notify", service, {"title": titles.get(job["status"], "Laptop"), "message": _cut(text, NOTIFY_CHARS)})
         except Exception as err:  # noqa: BLE001 - a missed notification must not lose the job's outcome
             _LOGGER.warning("Could not send the laptop's notification: %s", err)
 
     return notify
+
+
+async def _close_later(client: anthropic.AsyncAnthropic) -> None:
+    """Closes a client the settings replaced, once any answer it was still giving has had time to finish."""
+    await asyncio.sleep(120)
+    await client.close()
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -121,8 +157,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     shared = hass.data.setdefault(DOMAIN, {})
     # The queue outlives a change of settings, so a job waiting for the laptop is not lost.
     laptop: Laptop = shared.get("laptop") or Laptop(store=shared_memory(hass, "laptop"), now=time.time)
-    laptop.on_finished = notifier(hass, entry.options.get(CONF_NOTIFY, NO_NOTIFY))
+    laptop.on_finished = notifier(hass, entry.options.get(CONF_NOTIFY))
     laptop_on = entry.options.get(CONF_LAPTOP, True)
+    if not laptop_on:
+        # Switched off: stop what is running and drop what is waiting, as the setting promises.
+        await laptop.cancel("Called off: the laptop was switched off under Configure.")
     shared.update(
         laptop=laptop,
         laptop_on=laptop_on,
@@ -130,6 +169,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         stream_always=entry.options.get(CONF_STREAM, False),
         stt_provider=entry.options.get(CONF_STT_PROVIDER, DEFAULT_PROVIDER),
         stt_key=entry.options.get(CONF_STT_KEY, ""),
+        client=client,
     )
     shared["agent"] = Agent(
         ask_claude=make_ask(client),
@@ -142,6 +182,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         thread_seconds=60 * float(entry.options.get(CONF_FOLLOWUP, DEFAULT_FOLLOWUP)),
         laptop=laptop if laptop_on else None,
         log=_LOGGER.debug,
+        # Shared with the settings screen, so a hand edit of the notes never crosses an answer in progress.
+        lock=shared.setdefault("turn_lock", asyncio.Lock()),
     )
     # Addresses cannot be taken off the web server again, so they are added once and look the agent up each time.
     if not shared.get("views"):
@@ -160,4 +202,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     shared = hass.data.get(DOMAIN, {})
     shared.pop("agent", None)
     shared["laptop_on"] = False
+    client = shared.pop("client", None)
+    if client is not None:
+        hass.async_create_background_task(_close_later(client), "claude_agent: close the old Claude client")
     return True
