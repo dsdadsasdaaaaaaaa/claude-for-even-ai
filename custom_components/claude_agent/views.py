@@ -36,6 +36,7 @@ from .const import (
     LAPTOP_WATCH_PATH,
     MODELS_PATH,
     SESSION_END_PATH,
+    SESSION_LOG_PATH,
     SESSION_TURN_PATH,
 )
 from .laptop import Laptop
@@ -49,6 +50,7 @@ TIMINGS_KEPT = 30
 # remote-access proxy) cut connections that sit idle much longer, and each cut costs a reconnect.
 LAPTOP_WAIT = 15
 SESSION_REQUESTS_KEPT = 10
+SESSION_LOG_KEPT = 150
 
 
 def _agent(hass: HomeAssistant) -> Agent | None:
@@ -525,6 +527,37 @@ class SessionEndView(HomeAssistantView):
         return web.json_response({"ok": True})
 
 
+class SessionLogView(HomeAssistantView):
+    """Where the glasses app passes on its log, so a problem on the glasses can be read in the diagnostics."""
+
+    url = SESSION_LOG_PATH
+    name = "api:claude_agent:session:log"
+    requires_auth = False
+    cors_allowed = True
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
+
+    async def post(self, request: web.Request) -> web.Response:
+        agent = _agent(self._hass)
+        if agent is None:
+            return _error("The agent is not set up", HTTPStatus.SERVICE_UNAVAILABLE)
+        if not agent.authorized(_presented(request)):
+            return await _refuse()
+        try:
+            body = await request.json()
+        except ValueError:
+            return _error("The request body is not JSON", HTTPStatus.BAD_REQUEST)
+        lines = body.get("lines") if isinstance(body, dict) else None
+        if not isinstance(lines, list):
+            return _error("The request needs lines", HTTPStatus.BAD_REQUEST)
+        kept = self._hass.data[DOMAIN].setdefault("session_app_log", deque(maxlen=SESSION_LOG_KEPT))
+        for line in lines[-SESSION_LOG_KEPT:]:
+            if isinstance(line, str):
+                kept.append(line[:300])
+        return web.json_response({"ok": True})
+
+
 def register_views(hass: HomeAssistant) -> None:
     """Add the addresses to Home Assistant's web server. They stay for as long as it runs."""
     hass.http.register_view(HealthView(hass))
@@ -536,3 +569,4 @@ def register_views(hass: HomeAssistant) -> None:
     hass.http.register_view(LaptopDoneView(hass))
     hass.http.register_view(SessionTurnView(hass))
     hass.http.register_view(SessionEndView(hass))
+    hass.http.register_view(SessionLogView(hass))
