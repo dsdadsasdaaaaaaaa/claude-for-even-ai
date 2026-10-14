@@ -214,6 +214,7 @@ class ChatView(HomeAssistantView):
                     "tools": stats.get("tools", []),
                     "cache_read": stats.get("cache_read", 0),
                     "cache_written": stats.get("cache_written", 0),
+                    "model": stats.get("model", ""),
                     "stop": (result or {}).get("stop_reason", ""),
                     "error": error,
                 }
@@ -322,7 +323,7 @@ class LaptopNextView(HomeAssistantView):
         job = await laptop.next(LAPTOP_WAIT)
         if job is None:
             return web.Response(status=HTTPStatus.NO_CONTENT, headers=WAIT_HEADER)
-        return web.json_response({"id": job["id"], "task": job["task"], "follow_up": job["follow_up"]}, headers=WAIT_HEADER)
+        return web.json_response({"id": job["id"], "task": job["task"], "follow_up": job["follow_up"], "model": job.get("model")}, headers=WAIT_HEADER)
 
 
 async def _job_id(request: web.Request) -> str | None:
@@ -540,6 +541,7 @@ class SessionTurnView(HomeAssistantView):
                         "tools": stats.get("tools", []),
                         "cache_read": stats.get("cache_read", 0),
                         "cache_written": stats.get("cache_written", 0),
+                        "model": stats.get("model", ""),
                         "stop": result.get("stop_reason", ""),
                         "error": "",
                     }

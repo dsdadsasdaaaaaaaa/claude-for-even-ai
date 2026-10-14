@@ -25,11 +25,12 @@ CONF_STT_KEY = "stt_key"
 CONF_NEW_TOKEN = "new_even_key"
 CONF_NEW_LAPTOP_TOKEN = "new_laptop_key"
 
-DEFAULT_MODEL = "claude-sonnet-5-5"
+DEFAULT_MODEL = "auto"
 DEFAULT_EFFORT = "low"
 
 MODELS = {
-    "claude-sonnet-5-5": "Claude Sonnet 5.5 (fast, recommended)",
+    "auto": "Automatic: Haiku for quick questions, Sonnet when one needs more, Opus when asked to think hard (recommended)",
+    "claude-sonnet-5-5": "Claude Sonnet 5.5 (fast)",
     "claude-opus-5-5": "Claude Opus 5.5 (most capable, slower to start)",
     "claude-haiku-5-5": "Claude Haiku 5.5 (fastest)",
 }

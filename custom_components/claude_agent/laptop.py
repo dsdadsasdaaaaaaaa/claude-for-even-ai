@@ -33,6 +33,9 @@ REPEAT_SECONDS = 60
 MAX_TASK_CHARS = 4000
 MAX_RESULT_CHARS = 2000
 
+# Which Claude the agent chose for a job, when it chose.
+MODELS = ("haiku", "sonnet", "opus")
+
 WAITING, OFFERED, RUNNING = "waiting", "offered", "running"
 DONE, FAILED, EXPIRED, CANCELLED = "done", "failed", "expired", "cancelled"
 STATUSES = (WAITING, OFFERED, RUNNING, DONE, FAILED, EXPIRED, CANCELLED)
@@ -80,6 +83,7 @@ def read_jobs(raw: Any) -> tuple[list[Job], float | None]:
             "result": job["result"] if isinstance(job.get("result"), str) else "",
             "lost": job.get("lost") is True,
             "stats": _stats(job.get("stats")),
+            "model": job["model"] if job.get("model") in MODELS else None,
         }
         for job in (stored if isinstance(stored, list) else [])
         if isinstance(job, dict)
@@ -153,8 +157,9 @@ class Laptop:
     def online(self) -> bool:
         return self.seen is not None and self._now() - self.seen < ONLINE_SECONDS
 
-    async def submit(self, task: str, *, follow_up: bool = False) -> Job:
-        """Queue a job and return it. A follow-up carries on from the laptop's previous job.
+    async def submit(self, task: str, *, follow_up: bool = False, model: str | None = None) -> Job:
+        """Queue a job and return it. A follow-up carries on from the laptop's previous job; `model` is which Claude
+        should do it, when the agent chose one.
 
         The same job asked for again while it waits, or within a minute of starting, is not queued a second time:
         the existing one comes back with "repeat" set.
@@ -182,6 +187,7 @@ class Laptop:
                 "result": "",
                 "lost": False,
                 "stats": {},
+                "model": model if model in MODELS else None,
             }
             self._jobs.append(job)
             await self._save()

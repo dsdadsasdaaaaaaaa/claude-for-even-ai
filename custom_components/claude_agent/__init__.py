@@ -71,6 +71,8 @@ def make_ask(client: anthropic.AsyncAnthropic) -> Callable[[dict[str, Any], Call
             options["betas"] = [FALLBACK_BETA]
         if request.get("tool_choice"):
             options["tool_choice"] = request["tool_choice"]
+        if request.get("thinking"):
+            extra_body["thinking"] = request["thinking"]
         async with client.beta.messages.stream(
             model=request["model"],
             max_tokens=request["max_tokens"],

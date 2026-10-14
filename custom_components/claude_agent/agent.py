@@ -46,6 +46,8 @@ QUICK_NOTE = """This is a quick question through Even AI on the glasses. Nothing
 
 Each press of the button is often a new question. Earlier turns are included only while they keep talking within a few minutes of each other, and you are told how long ago their last message was. Connect a message to earlier turns only when it clearly follows on (it refers back with words like "it" or "that", or carries on the same topic). Otherwise treat it as a fresh question and leave the earlier topic alone. They can say "new chat" to start over."""
 
+FIRST_NOTE = """You answer first, on a quick, lightweight model, and a stronger one is standing by. Answer what you can answer well straight away: facts you are sure of, short explanations, conversation, saving and removing notes, looking back at earlier conversations, and anything to do with their laptop (sending a job, how one went, calling one off). When a good answer needs more, call hand_off before you write anything, and the stronger model answers in your place: careful thought (advice, plans, comparisons, maths, explaining something subtle), and anything current or that you are not sure of (it can search the web). When in doubt about a question, hand off."""
+
 SESSION_NOTE = """This is a session in their own glasses app, not a quick question: they opened it for a longer conversation, and every earlier turn here belongs to it until they end it or say "new chat". They hold or tap the ring while they speak, so the words are nearly always theirs, but a word or two from someone nearby can slip in at the start or end, and speech-to-text can mishear; what is said above about words that may not be theirs still applies. Your answer appears on the glasses as you write it and the display scrolls, so a fuller answer is fine when they want one, up to about 250 words, and a quick question still gets a quick answer."""
 
 REMEMBER = {
@@ -110,6 +112,11 @@ LAPTOP = {
                 "type": "boolean",
                 "description": "True only when this carries on from the laptop job you just sent (such as \"now close it\"), so the laptop keeps that job's context.",
             },
+            "model": {
+                "type": "string",
+                "enum": ["haiku", "sonnet", "opus"],
+                "description": "Which Claude does the job: haiku for a simple, clear one (open an app or a site, play something), sonnet for most, opus for a hard one (several apps or steps, a lot to read or write, or one that went wrong before).",
+            },
             "changes_things": {
                 "type": "boolean",
                 "description": "True when the job deletes, overwrites or empties anything, sends, posts or shares anything, buys, pays for or cancels anything, installs or uninstalls anything, submits or uploads anything, or shuts down or restarts the laptop.",
@@ -120,6 +127,22 @@ LAPTOP = {
             },
         },
         "required": ["job", "say"],
+        "additionalProperties": False,
+    },
+}
+
+HAND_OFF = {
+    "name": "hand_off",
+    "description": (
+        "Pass this question to a stronger model, which answers it in your place. Call it before writing anything, when "
+        "a good answer needs careful thought or the web."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "why": {"type": "string", "enum": ["thinking", "web"], "description": "What the question needs: careful thought, or the web."},
+        },
+        "required": ["why"],
         "additionalProperties": False,
     },
 }
@@ -274,6 +297,20 @@ ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # A safety classifier can decline a harmless question; these models let the API retry it on a substitute.
 FALLBACK_MODELS = re.compile(r"^claude-(opus|sonnet)-5-5")
 
+HAIKU = "claude-haiku-5-5"
+SONNET = "claude-sonnet-5-5"
+OPUS = "claude-opus-5-5"
+# The model setting that picks for itself: quick questions start on Haiku, which hands what needs more to Sonnet, and
+# sessions are on Sonnet, or Opus when they ask it to think hard.
+AUTO = "auto"
+LAPTOP_MODELS = ("haiku", "sonnet", "opus")
+# Asking for the deepest thinking, in so many words.
+THINK_HARD = re.compile(
+    r"\b(?:think(?:ing)?\s+(?:really\s+|very\s+)?(?:hard(?:er)?|deep(?:ly)?|carefully|long|it\s+(?:all\s+)?through)|deep\s+think(?:ing)?"
+    r"|really\s+think|take\s+your\s+time|ultra\s*think|(?:use|with|switch\s+to)\s+opus)\b",
+    re.IGNORECASE,
+)
+
 Message = dict[str, Any]
 OnText = Callable[[str], Awaitable[None]]
 
@@ -309,7 +346,7 @@ class Laptop(Protocol):
 
     def online(self) -> bool: ...
 
-    async def submit(self, task: str, *, follow_up: bool = False) -> dict[str, Any]: ...
+    async def submit(self, task: str, *, follow_up: bool = False, model: str | None = None) -> dict[str, Any]: ...
 
     async def cancel(self) -> list[dict[str, Any]]: ...
 
@@ -644,7 +681,9 @@ class Agent:
         self._store = store
         self._now = now
         self.model = model
+        self._auto = model == AUTO
         self._effort = effort
+        self._laptop_on = laptop is not None
         self._thread_seconds = thread_seconds
         self._laptop = laptop
         self._log = log or (lambda line: None)
@@ -659,15 +698,28 @@ class Agent:
             if about
             else instructions
         )
-        # The newer search tool filters its own results; Haiku is only offered the basic one.
-        search = {
-            "type": "web_search_20250305" if model.startswith("claude-haiku") else "web_search_20260209",
-            "name": "web_search",
-            "max_uses": 3,
-        }
-        # The same list every time, so it stays in the prompt cache.
-        self._tools = [REMEMBER, FORGET, EARLIER, search, *([LAPTOP, LAPTOP_STATUS, CANCEL_LAPTOP] if laptop else [])]
-        self._fallback = bool(FALLBACK_MODELS.match(model))
+        self._tool_sets: dict[tuple[str, bool], list[dict[str, Any]]] = {}
+
+    def _tools_for(self, model: str, first: bool = False) -> list[dict[str, Any]]:
+        """The tools offered on `model`; the same list every time for the same model, so it stays in the prompt cache.
+        Haiku answering first gets the light ones and hand_off; the web and the laptop are for the stronger model."""
+        key = (model, first)
+        if key not in self._tool_sets:
+            if first:
+                # Haiku sends laptop jobs itself: handing them on would make Even AI wait too long for the reply.
+                tools = [REMEMBER, FORGET, EARLIER, HAND_OFF, *([LAPTOP, LAPTOP_STATUS, CANCEL_LAPTOP] if self._laptop_on else [])]
+            else:
+                # The newer search tool filters its own results; Haiku is only offered the basic one.
+                search = {"type": "web_search_20250305" if model.startswith("claude-haiku") else "web_search_20260209", "name": "web_search", "max_uses": 3}
+                tools = [REMEMBER, FORGET, EARLIER, search, *([LAPTOP, LAPTOP_STATUS, CANCEL_LAPTOP] if self._laptop_on else [])]
+            self._tool_sets[key] = tools
+        return self._tool_sets[key]
+
+    def _session_model(self, said: str) -> tuple[str, str]:
+        """The model and effort for a session turn: Opus thinking hard when they ask for that, otherwise the usual."""
+        if THINK_HARD.search(said):
+            return OPUS, "high"
+        return (SONNET if self._auto else self.model), self._effort
 
     def authorized(self, presented: str) -> bool:
         """Whether the key the app presented is the right one."""
@@ -741,20 +793,26 @@ class Agent:
         changes: list[dict[str, str]],
         since: float | None,
         session: bool = False,
+        *,
+        model: str | None = None,
+        effort: str | None = None,
+        first: bool = False,
     ) -> dict[str, Any]:
+        model = model or (SONNET if self._auto else self.model)
+        note = SESSION_NOTE if session else (f"{QUICK_NOTE}\n\n{FIRST_NOTE}" if first else QUICK_NOTE)
         return {
-            "model": self.model,
+            "model": model,
             "max_tokens": MAX_TOKENS,
-            "effort": self._effort,
-            "fallback": self._fallback,
+            "effort": effort or self._effort,
+            "fallback": bool(FALLBACK_MODELS.match(model)),
             # Ordered from what never changes to what changes every time, so as much as possible is served from the
             # prompt cache: the instructions, the notes, how this kind of conversation works, the conversation so far.
             "system": [
                 {"type": "text", "text": self._fixed, "cache_control": {"type": "ephemeral"}},
                 {"type": "text", "text": self._notes_block(notes), "cache_control": {"type": "ephemeral"}},
-                {"type": "text", "text": SESSION_NOTE if session else QUICK_NOTE},
+                {"type": "text", "text": note},
             ],
-            "tools": self._tools,
+            "tools": self._tools_for(model, first),
             "messages": with_context(messages, self._context(app_notes, changes, since, session)),
         }
 
@@ -961,7 +1019,8 @@ class Agent:
                 'In a few words, ask them to say it again with "on my laptop" if they want it.',
                 "is_error": True,
             }
-        job = await self._laptop.submit(task, follow_up=given.get("follow_up") is True and (followed or turn["sent_job"]))
+        model = given.get("model") if given.get("model") in LAPTOP_MODELS else None
+        job = await self._laptop.submit(task, follow_up=given.get("follow_up") is True and (followed or turn["sent_job"]), model=model)
         turn["sent_job"] = True
         turn["state"]["laptop_at"] = now
         if job.get("repeat"):
@@ -1081,6 +1140,12 @@ class Agent:
             calls = (result.get("tool_calls") or []) if stop_reason == "tool_use" else []
             if not calls:
                 break
+            # Answering first, Claude passed the question on: nothing else from this round is carried out.
+            handing = next((call for call in calls if call.get("name") == "hand_off"), None)
+            if handing is not None:
+                why = handing["input"].get("why") if isinstance(handing.get("input"), dict) else None
+                usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+                return {"text": "", "usage": usage, "stop_reason": stop_reason, "stats": stats, "hand_off": why if why in ("thinking", "web") else "thinking"}
             messages.append({"role": "assistant", "content": result["content"]})
             outcomes = [await self._use_tool(call, turn) for call in calls]
             # A tool that turned the call down is marked, so the diagnostics show a laptop job that did not go out.
@@ -1122,9 +1187,45 @@ class Agent:
         *,
         session: bool = False,
     ) -> dict[str, Any]:
-        """Asks Claude, carrying out any tools it uses, and returns its answer."""
-        request = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, session)
+        """Asks Claude, carrying out any tools it uses, and returns its answer.
+
+        With the model set to pick for itself, a quick question goes to Haiku first, held back rather than shown as it
+        is written, so that when Haiku hands the question on, nothing it wrote is seen; Sonnet then answers it.
+        """
+        spent: dict[str, Any] | None = None
+        if session:
+            model, effort = self._session_model(turn["latest"])
+            used = model.split("-")[1]
+        elif self._auto:
+            first = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, model=HAIKU, effort=self._effort, first=True)
+            # No thinking pass first: Even AI gives up after a few seconds, and what needs thought is handed on anyway.
+            first["thinking"] = {"type": "disabled"}
+            tried = await self._run(first, state, turn, None)
+            if not tried.get("hand_off") and tried["stop_reason"] != "refusal" and tried["text"]:
+                tried["stats"]["model"] = "haiku"
+                if on_text:
+                    await on_text(tried["text"])
+                return tried
+            # Haiku passed it on, or could not answer (it has no fallback of its own when a classifier declines).
+            why = tried.get("hand_off") or ("refused" if tried["stop_reason"] == "refusal" else "no answer")
+            spent = tried
+            # Even AI is still waiting, so the effort stays where it is set; Sonnet thinks as much as it needs within it.
+            model, effort = SONNET, self._effort
+            used = f"haiku, then sonnet ({why})"
+            turn["partial"] = ""
+        else:
+            model, effort = self.model, self._effort
+            used = model.split("-")[1] if model.startswith("claude-") else model
+        request = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, session, model=model, effort=effort)
         result = await self._run(request, state, turn, on_text)
+        result["stats"]["model"] = used
+        if spent:
+            # What the first try cost counts too.
+            for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                result["usage"][name] += spent["usage"][name]
+            for name in ("requests", "searches", "cache_read", "cache_written"):
+                result["stats"][name] += spent["stats"][name]
+            result["stats"]["tools"] = spent["stats"]["tools"] + result["stats"]["tools"]
         if result["stop_reason"] == "refusal":
             # A classifier stopped the answer: whatever came before is dropped, as the API asks.
             partial = result["text"]
