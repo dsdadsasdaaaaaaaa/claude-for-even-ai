@@ -18,6 +18,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime
 import hmac
+import json
 import re
 from typing import Any, Protocol
 
@@ -26,6 +27,7 @@ from .gate import MENTIONS_LAPTOP, changes_things
 from .prompts import (
     BUSY,
     CANCEL_LAPTOP,
+    CANCEL_REMINDER,
     CUT_OFF,
     EARLIER,
     EMPTY,
@@ -43,8 +45,13 @@ from .prompts import (
     NO_CREDIT,
     NOTHING_ASKED,
     QUICK_NOTE,
+    REFLECT_INSTRUCTIONS,
     REFUSED,
     REMEMBER,
+    REMIND,
+    REMINDER_INSTRUCTIONS,
+    SCHEDULE,
+    SCHEDULE_INSTRUCTIONS,
     SESSION_NOTE,
 )
 from .state import EARLIER_KEPT, MAX_NOTE_CHARS, MAX_NOTES, parse_day, read_state
@@ -52,6 +59,12 @@ from .state import EARLIER_KEPT, MAX_NOTE_CHARS, MAX_NOTES, parse_day, read_stat
 # Tools that can share a round with a laptop job without needing Claude to say more once they work.
 # Skipping that extra request makes a laptop request quicker and cheaper.
 NO_FOLLOW_UP = {"laptop", "remember", "forget"}
+# How long a reply waits for the laptop's answer to a question about it: a quick question through Even AI cannot wait
+# long, while a session in the glasses app streams and can.
+RESULT_WAIT_SECONDS = 8
+SESSION_RESULT_WAIT_SECONDS = 20
+# How much of the day's conversations the night's look over them reads.
+REFLECT_CHARS = 40_000
 
 # A web search that pauses or a tool being used each cost one more request to Claude.
 MAX_REQUESTS = 6
@@ -109,6 +122,15 @@ THINK_HARD = re.compile(
     re.IGNORECASE,
 )
 
+# Questions the quick model would only hand on, because a good answer needs the web. (Anything for the laptop is
+# spotted with MENTIONS_LAPTOP.) These go to Sonnet straight away, which saves the hand-off's second.
+NEEDS_MORE = re.compile(
+    r"\b(?:search(?:\s+(?:for|the\s+web|online))?|look\s+(?:it\s+|that\s+|this\s+)?up|google|latest|news|headlines?|weather|forecast"
+    r"|scores?|who\s+won|price\s+of|stocks?|exchange\s+rate|right\s+now|currently|at\s+the\s+moment"
+    r"|(?:today|tonight|this\s+week)'?s\s+(?:news|weather|game|match|forecast))\b",
+    re.IGNORECASE,
+)
+
 OnText = Callable[[str], Awaitable[None]]
 
 # The end of a sentence, allowing for a closing quote or bracket after it.
@@ -148,6 +170,24 @@ class Laptop(Protocol):
     async def cancel(self) -> list[dict[str, Any]]: ...
 
     async def recent(self, within: float) -> list[dict[str, Any]]: ...
+
+    async def outcome(self, job_id: str, wait: float) -> dict[str, Any] | None: ...
+
+
+class Reminders(Protocol):
+    """The reminders they set (see reminders.py)."""
+
+    async def add(self, text: str, at: float) -> dict[str, Any]: ...
+
+    async def cancel(self, number: int) -> dict[str, Any] | None: ...
+
+    async def pending(self) -> list[dict[str, Any]]: ...
+
+
+class Schedule(Protocol):
+    """Their day from their planner (see dayflow.py)."""
+
+    async def text(self, day: str | None = None) -> str: ...
 
 
 class BadRequest(Exception):
@@ -252,6 +292,8 @@ class Agent:
         profile: str = "",
         thread_seconds: float = THREAD_SECONDS,
         laptop: Laptop | None = None,
+        reminders: Reminders | None = None,
+        schedule: Schedule | None = None,
         log: Callable[[str], None] | None = None,
         lock: asyncio.Lock | None = None,
     ) -> None:
@@ -267,13 +309,17 @@ class Agent:
         self._laptop_on = laptop is not None
         self._thread_seconds = thread_seconds
         self._laptop = laptop
+        self._reminders = reminders
+        self._schedule = schedule
         self._log = log or (lambda line: None)
         # One memory, so one request at a time; shared with the settings screen when it edits the notes.
         self._turn = lock or asyncio.Lock()
 
         about = profile.strip()
         self.profile = about
-        instructions = f"{INSTRUCTIONS}\n\n{LAPTOP_INSTRUCTIONS}" if laptop else INSTRUCTIONS
+        instructions = "\n\n".join(
+            [INSTRUCTIONS, *([LAPTOP_INSTRUCTIONS] if laptop else []), *([REMINDER_INSTRUCTIONS] if reminders else []), *([SCHEDULE_INSTRUCTIONS] if schedule else [])]
+        )
         self._fixed = (
             f"{instructions}\n\nTheir profile, in their own words. Treat it as trusted background.\n<profile>\n{about}\n</profile>"
             if about
@@ -286,12 +332,13 @@ class Agent:
         Haiku answering first gets the light ones and hand_off; the web and the laptop are for the stronger model."""
         key = (model, first)
         if key not in self._tool_sets:
+            light = [*([REMIND, CANCEL_REMINDER] if self._reminders else []), *([SCHEDULE] if self._schedule else [])]
             if first:
-                tools = [REMEMBER, FORGET, EARLIER, HAND_OFF, *([LAPTOP_STATUS, CANCEL_LAPTOP] if self._laptop_on else [])]
+                tools = [REMEMBER, FORGET, EARLIER, HAND_OFF, *([LAPTOP_STATUS, CANCEL_LAPTOP] if self._laptop_on else []), *light]
             else:
                 # The newer search tool filters its own results; Haiku is only offered the basic one.
                 search = {"type": "web_search_20250305" if model.startswith("claude-haiku") else "web_search_20260209", "name": "web_search", "max_uses": 3}
-                tools = [REMEMBER, FORGET, EARLIER, search, *([LAPTOP, LAPTOP_STATUS, CANCEL_LAPTOP] if self._laptop_on else [])]
+                tools = [REMEMBER, FORGET, EARLIER, search, *([LAPTOP, LAPTOP_STATUS, CANCEL_LAPTOP] if self._laptop_on else []), *light]
             self._tool_sets[key] = tools
         return self._tool_sets[key]
 
@@ -345,13 +392,16 @@ class Agent:
             heading += f"\nNotes 1 to {first_shown} are older and not shown here for space."
         return heading + "\n" + "\n".join(lines)
 
-    def _context(self, app_notes: str, changes: list[dict[str, str]], since: float | None, session: bool) -> str:
-        """What is true for this request only: the time, how long since their last message, and what the app sent."""
+    def _context(self, app_notes: str, changes: list[dict[str, str]], since: float | None, session: bool, reminders: str = "") -> str:
+        """What is true for this request only: the time, how long since their last message, their reminders, and what
+        the app sent."""
         now = self._now()
         zone = f" {now.tzname()}" if now.tzname() else ""
         live = f"Right now it is {now:%A}, {now:%B} {now.day}, {now.year} at {self._clock(now)}{zone}."
         if since is not None:
             live += f" Their last message in this {'session' if session else 'conversation'} was {ago(since)} ago."
+        if reminders:
+            live += f"\n\n{reminders}"
         if changes:
             # Earlier turns are kept as words only, so without this Claude would see itself
             # saying "saved" or "forgotten" with nothing to show that it really happened.
@@ -377,6 +427,7 @@ class Agent:
         model: str | None = None,
         effort: str | None = None,
         first: bool = False,
+        reminders: str = "",
     ) -> dict[str, Any]:
         model = model or (SONNET if self._auto else self.model)
         note = SESSION_NOTE if session else (f"{QUICK_NOTE}\n\n{FIRST_NOTE}" if first else QUICK_NOTE)
@@ -393,7 +444,7 @@ class Agent:
                 {"type": "text", "text": note},
             ],
             "tools": self._tools_for(model, first),
-            "messages": with_context(messages, self._context(app_notes, changes, since, session)),
+            "messages": with_context(messages, self._context(app_notes, changes, since, session, reminders)),
         }
 
     # ----- Memory -----
@@ -607,6 +658,7 @@ class Agent:
             self._log(f"already with the laptop: {task}")
             return {"content": "Already sent: the laptop has this job already, so it was not queued twice."}
         self._log(f"sent to the laptop: {task}")
+        turn["jobs"].append(job["id"])
         # What the wearer needs to hear besides Claude's own words, added to them when the reply goes out without
         # another request to Claude.
         if not self._laptop.online():
@@ -615,6 +667,18 @@ class Agent:
                 "content": "Queued, but the laptop is off or asleep right now. It runs when the laptop is next on, if that is "
                 "within 12 hours, and the outcome goes to their phone then. Tell them that."
             }
+        if given.get("answer_now") is True:
+            # A question about the laptop: the reply waits a little for its answer, which Claude then passes on.
+            wait = SESSION_RESULT_WAIT_SECONDS if turn["session"] else RESULT_WAIT_SECONDS
+            done = await self._laptop.outcome(job["id"], wait)
+            if done is not None:
+                turn["answered"] = True
+                self._log(f"the laptop answered in time: {done['status']}")
+                if done["status"] == "done":
+                    return {"content": f"The laptop has looked, and reports: {done['result']}\nAnswer them from that, in your own words."}
+                return {"content": f"The laptop could not do it. It reports: {done['result']}\nTell them so, in a few words."}
+            turn["tell"].append("It is taking a little longer, so the answer goes to your phone when it is ready.")
+            return {"content": "Sent, but the laptop has not answered yet. The answer goes to their phone when it is ready; tell them that."}
         ahead = [
             other
             for other in await self._laptop.recent(LAPTOP_SECONDS)
@@ -648,7 +712,68 @@ class Agent:
             return {"content": await self._laptop_status()}
         if name == "cancel_laptop_job":
             return await self._cancel_laptop()
+        if name == "remind":
+            return await self._use_reminder(call)
+        if name == "cancel_reminder":
+            return await self._cancel_reminder(call)
+        if name == "schedule":
+            return await self._use_schedule(call)
         return {"content": "There is no such tool.", "is_error": True}
+
+    # ----- Reminders, and their day -----
+
+    async def _reminders_text(self) -> str:
+        """The reminders still to come, as Claude is told them with each request."""
+        if self._reminders is None:
+            return ""
+        waiting = await self._reminders.pending()
+        if not waiting:
+            return ""
+        lines = [f"{index + 1}. {self._when(one['at'])}: {one['text']}" for index, one in enumerate(waiting)]
+        return "Reminders they have set, soonest first (cancel_reminder takes the number):\n" + "\n".join(lines)
+
+    async def _use_reminder(self, call: dict[str, Any]) -> dict[str, Any]:
+        if self._reminders is None:
+            return {"content": "There is no such tool.", "is_error": True}
+        given = call.get("input") if isinstance(call.get("input"), dict) else {}
+        text = " ".join(given["text"].split()) if isinstance(given.get("text"), str) else ""
+        if not text:
+            return {"content": "Nothing was set: the reminder was empty.", "is_error": True}
+        moment = None
+        if isinstance(given.get("at"), str):
+            for pattern in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+                try:
+                    moment = datetime.strptime(given["at"].strip(), pattern)
+                    break
+                except ValueError:
+                    continue
+        if moment is None:
+            return {"content": "Nothing was set: the time must be written as YYYY-MM-DD HH:MM, in their local time.", "is_error": True}
+        now = self._now()
+        moment = moment.replace(tzinfo=now.tzinfo)
+        if moment <= now:
+            return {"content": "Nothing was set: that time has already passed. Work the time out from the time given to you.", "is_error": True}
+        reminder = await self._reminders.add(text, moment.timestamp())
+        self._log(f"reminder set for {self._when(reminder['at'])}: {text}")
+        return {"content": f"Set for {self._when(reminder['at'])}. It goes to their phone then; confirm it to them in a few words."}
+
+    async def _cancel_reminder(self, call: dict[str, Any]) -> dict[str, Any]:
+        if self._reminders is None:
+            return {"content": "There is no such tool.", "is_error": True}
+        given = call.get("input") if isinstance(call.get("input"), dict) else {}
+        number = given.get("number")
+        gone = await self._reminders.cancel(number) if isinstance(number, int) and not isinstance(number, bool) else None
+        if gone is None:
+            return {"content": "There is no reminder with that number.", "is_error": True}
+        self._log(f"reminder cancelled: {gone['text']}")
+        return {"content": f'Cancelled "{gone["text"]}".'}
+
+    async def _use_schedule(self, call: dict[str, Any]) -> dict[str, Any]:
+        if self._schedule is None:
+            return {"content": "There is no such tool.", "is_error": True}
+        given = call.get("input") if isinstance(call.get("input"), dict) else {}
+        day = given["day"].strip() if isinstance(given.get("day"), str) and given["day"].strip() else None
+        return {"content": await self._schedule.text(day)}
 
     def _new_turn(self, state: dict[str, Any], current: dict[str, Any] | None, latest: str, session_id: str | None) -> dict[str, Any]:
         """What one question works with, and what changes while it is answered."""
@@ -663,6 +788,11 @@ class Agent:
             "laptop_before": state["laptop_at"],
             "sent_job": False,
             "tell": [],
+            # The laptop jobs sent in this turn, and whether one answered in time, so Claude writes the answer itself.
+            "jobs": [],
+            "answered": False,
+            "session": session_id is not None,
+            "reminders": "",
             # The answer so far, kept should the app stop listening part-way.
             "partial": "",
         }
@@ -741,7 +871,7 @@ class Agent:
             # A laptop job that went out needs no second request, as what to tell them is already known:
             # the words Claude wrote alongside the call, or else the "say" it gave with the job.
             sent_job = any(call.get("name") == "laptop" for call in calls)
-            if sent_job and all(call.get("name") in NO_FOLLOW_UP for call in calls) and not any(outcome.get("is_error") for outcome in outcomes):
+            if sent_job and not turn["answered"] and all(call.get("name") in NO_FOLLOW_UP for call in calls) and not any(outcome.get("is_error") for outcome in outcomes):
                 if text[written_before:].strip():
                     break
                 said = " ".join(
@@ -773,11 +903,12 @@ class Agent:
         is written, so that when Haiku hands the question on, nothing it wrote is seen; Sonnet then answers it.
         """
         spent: dict[str, Any] | None = None
+        reminders = turn["reminders"]
         if session:
             model, effort = self._session_model(turn["latest"])
             used = model.split("-")[1]
-        elif self._auto:
-            first = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, model=HAIKU, effort=self._effort, first=True)
+        elif self._auto and not self._needs_more(turn["latest"]):
+            first = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, model=HAIKU, effort=self._effort, first=True, reminders=reminders)
             tried = await self._run(first, state, turn, None)
             if not tried.get("hand_off") and tried["stop_reason"] != "refusal" and tried["text"]:
                 tried["stats"]["model"] = "haiku"
@@ -792,9 +923,10 @@ class Agent:
             used = f"haiku, then sonnet ({why})"
             turn["partial"] = ""
         else:
-            model, effort = self.model, self._effort
-            used = model.split("-")[1] if model.startswith("claude-") else model
-        request = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, session, model=model, effort=effort)
+            # The chosen model; or, with the model picking for itself, a question Haiku would only hand on.
+            model, effort = (SONNET if self._auto else self.model), self._effort
+            used = model.split("-")[1]
+        request = self._build_request(messages, app_notes, state["notes"], turn["changes"], since, session, model=model, effort=effort, reminders=reminders)
         result = await self._run(request, state, turn, on_text)
         result["stats"]["model"] = used
         if spent:
@@ -816,6 +948,10 @@ class Agent:
             if on_text:
                 await on_text(EMPTY)
         return result
+
+    def _needs_more(self, said: str) -> bool:
+        """Whether a quick question is one the quick model would only hand on: for the laptop, or needing the web."""
+        return (self._laptop_on and MENTIONS_LAPTOP.search(said) is not None) or NEEDS_MORE.search(said) is not None
 
     @staticmethod
     def _worth_keeping(result: dict[str, Any]) -> bool:
@@ -872,6 +1008,7 @@ class Agent:
             since = started - thread["at"] if carried_on else None
             current = thread if same_conversation else None
             turn = self._new_turn(state, current, latest, None)
+            turn["reminders"] = await self._reminders_text()
 
             def keep(answer: str) -> None:
                 turns, _ = trimmed([*messages, {"role": "assistant", "content": answer}], MAX_TURNS, KEEP_TURNS)
@@ -897,6 +1034,7 @@ class Agent:
                 current["changes"] = turn["changes"][-MAX_CHANGES:]
                 state["thread"] = current
             await self._store.write(state)
+            result["jobs"] = turn["jobs"]
             return result
 
     async def session_reply(self, session_id: str, said: str, on_text: OnText | None = None) -> dict[str, Any]:
@@ -927,6 +1065,7 @@ class Agent:
             messages = [*(session["turns"] if session else []), {"role": "user", "content": said}]
             since = now - session["at"] if session else None
             turn = self._new_turn(state, session, said, session_id)
+            turn["reminders"] = await self._reminders_text()
 
             def keep(answer: str) -> None:
                 turns, dropped = trimmed([*messages, {"role": "assistant", "content": answer}], SESSION_TURNS, SESSION_KEEP_TURNS)
@@ -954,6 +1093,7 @@ class Agent:
             elif session:
                 session["changes"] = turn["changes"][-MAX_CHANGES:]
             await self._store.write(state)
+            result["jobs"] = turn["jobs"]
             return result
 
     async def end_session(self, session_id: str) -> None:
@@ -963,6 +1103,84 @@ class Agent:
             if session_id in state["sessions"]:
                 self._retire_sessions(state, only=session_id)
                 await self._store.write(state)
+
+    # ----- The night's look over the day -----
+
+    async def reflect(self) -> dict[str, Any]:
+        """Goes over the conversations since the last time, on the quick model, and saves what is worth keeping about
+        them as notes. Meant to run once a night; it costs a fraction of a cent."""
+        async with self._turn:
+            state = read_state(await self._store.read())
+            self._expire(state["notes"])
+            since = state["reflected_at"] or 0.0
+            now = self._now().timestamp()
+            found = [old for old in state["earlier"] if old["at"] > since]
+            found += [
+                {"started": one["started"], "at": one["at"], "turns": one["turns"], "kind": "session"}
+                for one in state["sessions"].values()
+                if one["at"] > since
+            ]
+            thread = state["thread"]
+            if thread and thread["at"] > since:
+                found.append({"started": thread["started"], "at": thread["at"], "turns": thread["turns"], "kind": "chat"})
+            found.sort(key=lambda old: old["at"])
+            if not found:
+                return {"added": [], "looked_at": 0}
+            request = {
+                "model": HAIKU,
+                "max_tokens": 1024,
+                "effort": "low",
+                "fallback": False,
+                "system": [{"type": "text", "text": f"{REFLECT_INSTRUCTIONS}\n\n{self._notes_block(state['notes'])}"}],
+                "tools": [],
+                "messages": [{"role": "user", "content": f"{self._conversations_text(found, REFLECT_CHARS)}\n\nReply with the JSON only."}],
+            }
+            pieces: list[str] = []
+
+            async def collect(delta: str | None) -> None:
+                if delta:
+                    pieces.append(delta)
+
+            await self._ask_claude(request, collect)
+            added = self._add_notes(state["notes"], "".join(pieces), now)
+            state["reflected_at"] = now
+            await self._store.write(state)
+            self._log(f"looked over {len(found)} conversation(s) and kept {len(added)} note(s)")
+            return {"added": added, "looked_at": len(found)}
+
+    def _conversations_text(self, found: list[dict[str, Any]], limit: int) -> str:
+        """The conversations, oldest first, cut from the front when there is more than `limit`."""
+        parts: list[str] = []
+        for old in found:
+            what = "Session in their glasses app" if old.get("kind") == "session" else "Conversation"
+            heading = f"{what} from {self._when(old['started'])} to {self._when(old['at'])}:"
+            lines = [f"{'They' if turn['role'] == 'user' else 'You'} said: {turn['content']}" for turn in old["turns"]]
+            parts.append("\n".join([heading, *lines]))
+        text = "\n\n".join(parts)
+        if len(text) > limit:
+            text = "(The start is left out.)\n" + text[-limit:]
+        return text
+
+    def _add_notes(self, notes: list[dict[str, Any]], written: str, now: float) -> list[str]:
+        """Saves the notes in Claude's JSON reply that are new, up to the room there is. Returns them."""
+        start, end = written.find("{"), written.rfind("}")
+        try:
+            parsed = json.loads(written[start : end + 1]) if start >= 0 and end > start else None
+        except ValueError:
+            parsed = None
+        given = parsed.get("notes") if isinstance(parsed, dict) else None
+        if not isinstance(given, list):
+            self._log("the look over the day gave no usable list of notes")
+            return []
+        added: list[str] = []
+        for raw in given:
+            note = " ".join(raw.split())[:MAX_NOTE_CHARS] if isinstance(raw, str) else ""
+            if not note or any(saved["text"].lower() == note.lower() for saved in notes) or len(notes) >= MAX_NOTES:
+                continue
+            notes.append({"at": now, "text": note})
+            added.append(note)
+            self._log(f"remembered from the day: {note}")
+        return added
 
     async def edit_notes(self, edit: Callable[[list[dict[str, Any]]], list[dict[str, Any]]]) -> None:
         """Change the notes by hand, between questions, so an answer in progress cannot write over the edit."""

@@ -78,14 +78,16 @@ def loudness(audio: bytes) -> float:
     return loudest
 
 
-def probably_silence(text: str, audio: bytes, hints: str = "") -> bool:
+def probably_silence(text: str, audio: bytes, hints: str = "", *, seconds: float | None = None, loud: float | None = None) -> bool:
     """Whether the words are what Whisper makes of a recording with nobody talking to it: a press too short, a stock
-    phrase from a quiet recording, or the list of names it was given, read back."""
+    phrase from a quiet recording, or the list of names it was given, read back. A compressed recording cannot be
+    measured here, so the app says how long and how loud it was."""
     words = " ".join(re.sub(r"[^\w\s']", " ", text.lower()).split())
-    if seconds_of(audio) < 0.5:
+    length = seconds if seconds is not None else seconds_of(audio)
+    if length < 0.5:
         return True
-    if words in SILENCE_WORDS and seconds_of(audio) < 4:
-        return words == "" or loudness(audio) < SPOKEN_LOUDNESS
+    if words in SILENCE_WORDS and length < 4:
+        return words == "" or (loud if loud is not None else loudness(audio)) < SPOKEN_LOUDNESS
     hint_words = set(re.findall(r"[\w']+", hints.lower()))
     said = words.split()
     return len(said) >= 3 and all(word in hint_words for word in said)
@@ -172,19 +174,38 @@ COMMON = {
 }
 
 
-async def transcribe(http: Any, provider: str, key: str, audio: bytes, words: str = "", language: str = "en") -> str:
-    """The words in `audio`, a WAV recording. `http` is an aiohttp client session."""
+# What a recording may come as: WAV, or Opus in an Ogg file, which is a fifteenth the size.
+WAV_TYPES = ("audio/wav", "audio/x-wav", "audio/wave")
+OGG_TYPES = ("audio/ogg", "audio/opus")
+
+
+def is_ogg(audio: bytes) -> bool:
+    return len(audio) > 28 and audio[:4] == b"OggS"
+
+
+async def transcribe(http: Any, provider: str, key: str, audio: bytes, words: str = "", language: str = "en", content_type: str = "audio/wav") -> str:
+    """The words in `audio`, a WAV recording or Opus in an Ogg file (`content_type` says which). `http` is an aiohttp
+    client session."""
     import aiohttp  # Home Assistant always has it; imported here so the rest can be tested without it.
 
     if not key:
         raise SpeechError("No speech-to-text key is set under Configure")
-    if not is_wav(audio):
-        raise SpeechError("The recording is not a WAV file")
+    kind = content_type.split(";")[0].strip().lower() or "audio/wav"
+    if kind in OGG_TYPES:
+        if not is_ogg(audio):
+            raise SpeechError("The recording is not an Ogg file")
+        filename, sent_as = "speech.ogg", "audio/ogg"
+    elif kind in WAV_TYPES:
+        if not is_wav(audio):
+            raise SpeechError("The recording is not a WAV file")
+        filename, sent_as = "speech.wav", "audio/wav"
+    else:
+        raise SpeechError("The recording is in a format that is not accepted")
     if len(audio) > MAX_AUDIO_BYTES:
         raise SpeechError("The recording is too long")
     preset = PROVIDERS.get(provider) or PROVIDERS[DEFAULT_PROVIDER]
     form = aiohttp.FormData()
-    form.add_field("file", audio, filename="speech.wav", content_type="audio/wav")
+    form.add_field("file", audio, filename=filename, content_type=sent_as)
     form.add_field("model", preset["model"])
     form.add_field("response_format", "json")
     if language:

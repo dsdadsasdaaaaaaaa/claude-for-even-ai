@@ -295,6 +295,36 @@ class Laptop:
                 await self._save()
             return cancelled
 
+    async def get(self, job_id: str) -> Job | None:
+        """One job, as it stands."""
+        async with self._lock:
+            await self._load()
+            if await self._tidy():
+                await self._save()
+            job = self._find(job_id)
+            return dict(job) if job else None
+
+    async def outcome(self, job_id: str, wait: float) -> Job | None:
+        """Waits up to `wait` seconds for a job to end, and returns it then; None while it is still going."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait
+        while True:
+            async with self._lock:
+                await self._load()
+                job = self._find(job_id)
+                if job is None:
+                    return None
+                if job["status"] not in UNFINISHED:
+                    return dict(job)
+                changed_event = self._changed
+            left = deadline - loop.time()
+            if left <= 0:
+                return None
+            try:
+                await asyncio.wait_for(changed_event.wait(), left)
+            except TimeoutError:
+                return None
+
     async def recent(self, within: float) -> list[Job]:
         """The jobs asked for in the last `within` seconds, oldest first."""
         async with self._lock:

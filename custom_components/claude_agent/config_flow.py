@@ -32,6 +32,8 @@ from homeassistant.helpers.selector import (
 
 from .const import (
     CHAT_PATH,
+    CONF_DAYFLOW_SECRET,
+    CONF_DAYFLOW_URL,
     CONF_EFFORT,
     CONF_FOLLOWUP,
     CONF_LAPTOP,
@@ -245,6 +247,10 @@ class ClaudeAgentOptionsFlow(OptionsFlow):
                     {name: preset["label"] for name, preset in PROVIDERS.items()}
                 ),
                 vol.Optional(CONF_STT_KEY, description={"suggested_value": current.get(CONF_STT_KEY, "")}): TextSelector(
+                    TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                ),
+                vol.Optional(CONF_DAYFLOW_URL, description={"suggested_value": current.get(CONF_DAYFLOW_URL, "")}): TextSelector(TextSelectorConfig(type=TextSelectorType.URL)),
+                vol.Optional(CONF_DAYFLOW_SECRET, description={"suggested_value": current.get(CONF_DAYFLOW_SECRET, "")}): TextSelector(
                     TextSelectorConfig(type=TextSelectorType.PASSWORD)
                 ),
                 vol.Required(CONF_LAPTOP, default=current.get(CONF_LAPTOP, True)): BooleanSelector(),

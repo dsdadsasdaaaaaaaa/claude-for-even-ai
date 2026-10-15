@@ -99,7 +99,15 @@ def read_state(raw: Any) -> dict[str, Any]:
         laptop_at: float | None = float(data["laptop_at"])
     else:
         laptop_at = max((one["laptop_at"] for one in [thread, *sessions.values()] if one and one["laptop_at"]), default=None)
-    return {"notes": notes, "thread": thread, "sessions": sessions, "earlier": earlier[-EARLIER_KEPT:], "laptop_at": laptop_at}
+    return {
+        "notes": notes,
+        "thread": thread,
+        "sessions": sessions,
+        "earlier": earlier[-EARLIER_KEPT:],
+        "laptop_at": laptop_at,
+        # When the night's look over the day's conversations last ran.
+        "reflected_at": float(data["reflected_at"]) if _number(data.get("reflected_at")) else None,
+    }
 
 
 NOTE_LINE = re.compile(r"^(?P<text>.*?)\s*\(until (?P<until>\d{4}-\d{2}-\d{2})\)$")

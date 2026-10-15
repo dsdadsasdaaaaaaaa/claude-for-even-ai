@@ -13,12 +13,15 @@ CONF_NOTIFY = "notify"
 NO_NOTIFY = "none"
 # Minutes of silence after which the next question starts a new conversation.
 CONF_FOLLOWUP = "followup_minutes"
-DEFAULT_FOLLOWUP = 3
+DEFAULT_FOLLOWUP = 10
 # Shown and edited under Configure, but kept with the agent's memory rather than in the settings.
 CONF_NOTES = "notes"
 # Speech to text for sessions from the glasses app.
 CONF_STT_PROVIDER = "stt_provider"
 CONF_STT_KEY = "stt_key"
+# DayFlow's live link, for their schedule: the relay address (ending in /relay) and its secret.
+CONF_DAYFLOW_URL = "dayflow_url"
+CONF_DAYFLOW_SECRET = "dayflow_secret"
 # Ticked under Configure to replace a key that may have got out; not kept in the settings.
 CONF_NEW_TOKEN = "new_even_key"
 CONF_NEW_LAPTOP_TOKEN = "new_laptop_key"
@@ -51,3 +54,4 @@ LAPTOP_DONE_PATH = f"{API_BASE}/laptop/done"
 SESSION_TURN_PATH = f"{API_BASE}/session/turn"
 SESSION_END_PATH = f"{API_BASE}/session/end"
 SESSION_LOG_PATH = f"{API_BASE}/session/log"
+SESSION_JOB_PATH = f"{API_BASE}/session/job"

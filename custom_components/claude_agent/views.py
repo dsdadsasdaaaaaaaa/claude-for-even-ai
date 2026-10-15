@@ -36,6 +36,7 @@ from .const import (
     LAPTOP_WATCH_PATH,
     MODELS_PATH,
     SESSION_END_PATH,
+    SESSION_JOB_PATH,
     SESSION_LOG_PATH,
     SESSION_TURN_PATH,
 )
@@ -391,11 +392,13 @@ def _session_id(request: web.Request) -> str:
 class SessionTurnView(HomeAssistantView):
     """One turn of a session from the glasses app.
 
-    The body is the recording made while the ring was held (a WAV file), or
-    {"text": ...} as JSON. The answer streams back as server-sent events:
-    {"type": "heard", "text"} with what was understood, then {"type": "text",
-    "text"} pieces of the answer as it is written, {"type": "error", "message"}
-    if something went wrong, and finally {"type": "done"}.
+    The body is the recording made while the ring was held (a WAV file, or Opus
+    in an Ogg file, with how long and how loud it was as `seconds` and `loudness`
+    in the address), or {"text": ...} as JSON. The answer streams back as
+    server-sent events: {"type": "heard", "text"} with what was understood, then
+    {"type": "text", "text"} pieces of the answer as it is written, {"type":
+    "job", "id"} for each laptop job sent, {"type": "error", "message"} if
+    something went wrong, and finally {"type": "done"}.
     """
 
     url = SESSION_TURN_PATH
@@ -431,6 +434,9 @@ class SessionTurnView(HomeAssistantView):
             return _error("The request needs the session's id", HTTPStatus.BAD_REQUEST)
         typed = None
         audio = b""
+        audio_type = request.content_type or "audio/wav"
+        # A compressed recording cannot be measured here, so the app says how long and how loud it was.
+        measured = {name: _float(request.query.get(name)) for name in ("seconds", "loudness")}
         if request.content_type == "application/json":
             try:
                 body = await request.json()
@@ -443,7 +449,8 @@ class SessionTurnView(HomeAssistantView):
             if len(audio) > speech.MAX_AUDIO_BYTES:
                 note("recording too long", bytes=len(audio))
                 return _error("The recording is too long", HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
-        kind = {"kind": "typed" if typed is not None else "recording", **({"audio_seconds": round(speech.seconds_of(audio), 1)} if typed is None else {})}
+        seconds = measured["seconds"] if measured["seconds"] is not None else speech.seconds_of(audio)
+        kind = {"kind": "typed" if typed is not None else "recording", **({"audio_seconds": round(seconds, 1), "audio": audio_type} if typed is None else {})}
 
         response = web.StreamResponse(
             headers={"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
@@ -477,8 +484,10 @@ class SessionTurnView(HomeAssistantView):
         try:
             if typed is None:
                 words = speech.vocabulary(agent.profile, await agent.vocabulary_sources())
-                said = await speech.transcribe(async_get_clientsession(self._hass), shared.get("stt_provider", ""), shared.get("stt_key", ""), audio, words)
-                if speech.probably_silence(said, audio, words):
+                said = await speech.transcribe(
+                    async_get_clientsession(self._hass), shared.get("stt_provider", ""), shared.get("stt_key", ""), audio, words, content_type=audio_type
+                )
+                if speech.probably_silence(said, audio, words, seconds=measured["seconds"], loud=measured["loudness"]):
                     said = ""
             else:
                 said = " ".join(typed.split())
@@ -502,6 +511,9 @@ class SessionTurnView(HomeAssistantView):
                     await send({"type": "text", "text": delta})
 
                 result = await agent.session_reply(session_id, said, on_text)
+                # The app watches each laptop job sent, so its outcome can be shown in the session when it is done.
+                for job_id in result.get("jobs") or []:
+                    await send({"type": "job", "id": job_id})
                 stats = result.get("stats") or {}
                 shared.setdefault("timings", deque(maxlen=TIMINGS_KEPT)).append(
                     {
@@ -566,6 +578,38 @@ class SessionEndView(HomeAssistantView):
         return web.json_response({"ok": True})
 
 
+def _float(value: str | None) -> float | None:
+    try:
+        return float(value) if value not in (None, "") else None
+    except ValueError:
+        return None
+
+
+class SessionJobView(HomeAssistantView):
+    """Where the glasses app asks how a laptop job sent from a session is going, so its outcome can be shown there."""
+
+    url = SESSION_JOB_PATH
+    name = "api:claude_agent:session:job"
+    requires_auth = False
+    cors_allowed = True
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        self._hass = hass
+
+    async def get(self, request: web.Request) -> web.Response:
+        agent = _agent(self._hass)
+        if agent is None:
+            return _error("The agent is not set up", HTTPStatus.SERVICE_UNAVAILABLE)
+        if not agent.authorized(_presented(request)):
+            return await _refuse()
+        laptop = self._hass.data[DOMAIN].get("laptop")
+        job_id = request.query.get("id", "")
+        job = await laptop.get(job_id) if laptop and job_id else None
+        if job is None:
+            return _error("No such job", HTTPStatus.NOT_FOUND)
+        return web.json_response({"status": job["status"], "result": job["result"]})
+
+
 class SessionLogView(HomeAssistantView):
     """Where the glasses app passes on its log, so a problem on the glasses can be read in the diagnostics."""
 
@@ -608,4 +652,5 @@ def register_views(hass: HomeAssistant) -> None:
     hass.http.register_view(LaptopDoneView(hass))
     hass.http.register_view(SessionTurnView(hass))
     hass.http.register_view(SessionEndView(hass))
+    hass.http.register_view(SessionJobView(hass))
     hass.http.register_view(SessionLogView(hass))

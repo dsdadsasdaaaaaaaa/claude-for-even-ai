@@ -15,7 +15,20 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_EFFORT, CONF_FOLLOWUP, CONF_MODEL, CONF_NOTIFY, CONF_PROFILE, DEFAULT_EFFORT, DEFAULT_FOLLOWUP, DEFAULT_MODEL, DOMAIN, NO_NOTIFY
+from .const import (
+    CONF_DAYFLOW_SECRET,
+    CONF_DAYFLOW_URL,
+    CONF_EFFORT,
+    CONF_FOLLOWUP,
+    CONF_MODEL,
+    CONF_NOTIFY,
+    CONF_PROFILE,
+    DEFAULT_EFFORT,
+    DEFAULT_FOLLOWUP,
+    DEFAULT_MODEL,
+    DOMAIN,
+    NO_NOTIFY,
+)
 from .memory import shared_memory
 from .state import read_state
 
@@ -23,6 +36,7 @@ from .state import read_state
 async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigEntry) -> dict[str, Any]:
     shared = hass.data.get(DOMAIN, {})
     laptop = shared.get("laptop")
+    reminders = shared.get("reminders")
     memory = read_state(await shared_memory(hass).read())
     return {
         "running": shared.get("agent") is not None,
@@ -35,6 +49,10 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, entry: ConfigE
         "earlier_conversations": len(memory["earlier"]),
         "speech_to_text": {"provider": shared.get("stt_provider"), "key_set": bool(shared.get("stt_key"))},
         "open_sessions": len(memory["sessions"]),
+        # When the night's look over the day's conversations last ran, and how many reminders wait.
+        "reflected_at": memory["reflected_at"],
+        "reminders_pending": len(await reminders.pending()) if reminders else 0,
+        "dayflow_linked": bool(entry.options.get(CONF_DAYFLOW_URL) and entry.options.get(CONF_DAYFLOW_SECRET)),
         "recent_requests": list(shared.get("shapes", [])),
         # How long each recent answer took and what went into it (searches, tools), without what was said.
         "recent_answers": list(shared.get("timings", [])),
